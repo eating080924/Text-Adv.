@@ -6,41 +6,53 @@ service cloud.firestore {
       allow read, write: if false;
     }
 
-    // Auth & Identity helpers
-    function isSignedIn() {
-      return request.auth != null;
+    // Helper functions
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_-]+$');
     }
 
-    // Word Player collection validation
+    function isNumeric(val) {
+      return val is int || val is float;
+    }
+
     match /world_players/{playerId} {
-      allow read: if isSignedIn();
-      allow create, update: if isSignedIn() 
-        && playerId == request.auth.uid
+      // Public reads allow players to see each other's location on the map in real-time
+      allow read: if request.auth != null;
+
+      // Allow players to create or update their own character stats
+      allow create, update: if request.auth != null
+        && isValidId(playerId)
         && request.resource.data.id == playerId
         && request.resource.data.name is string && request.resource.data.name.size() <= 32
         && request.resource.data.class is string && request.resource.data.class.size() <= 20
         && request.resource.data.faction is string && request.resource.data.faction.size() <= 10
-        && request.resource.data.level is int
-        && request.resource.data.hp is int
-        && request.resource.data.maxHp is int
-        && request.resource.data.mp is int
-        && request.resource.data.maxMp is int
-        && request.resource.data.atk is number
-        && request.resource.data.def is number
+        && isNumeric(request.resource.data.level)
+        && isNumeric(request.resource.data.hp)
+        && isNumeric(request.resource.data.maxHp)
+        && isNumeric(request.resource.data.mp)
+        && isNumeric(request.resource.data.maxMp)
+        && isNumeric(request.resource.data.atk)
+        && isNumeric(request.resource.data.def)
         && request.resource.data.isInWorld is bool
-        && request.resource.data.lastActive is int;
-      allow delete: if isSignedIn() && playerId == request.auth.uid;
+        && isNumeric(request.resource.data.lastActive)
+        && isNumeric(request.resource.data.pvpKills)
+        && isNumeric(request.resource.data.pvpDeaths);
 
-      // Attacks subcollection
+      // Allow deletion when a player leaves the game
+      allow delete: if request.auth != null && isValidId(playerId);
+
+      // Attacks subcollection - mailbox for receiving damage/status events
       match /attacks/{attackId} {
-        // Only the player themselves can read or clear their incoming attacks
-        allow read, delete: if isSignedIn() && playerId == request.auth.uid;
-        // Any signed-in rival can write a new attack to target's mailbox
-        allow create: if isSignedIn()
-          && request.resource.data.attackerUid == request.auth.uid
+        // Any player can read or clear their own mailbox
+        allow read, delete: if request.auth != null && isValidId(playerId);
+
+        // Any rival player can deposit an attack message into the target's mailbox
+        allow create: if request.auth != null && isValidId(playerId)
+          && request.resource.data.attackerUid is string && request.resource.data.attackerUid.size() <= 128
           && request.resource.data.attackerName is string && request.resource.data.attackerName.size() <= 32
-          && request.resource.data.damage is int && request.resource.data.damage >= 0 && request.resource.data.damage <= 10000
-          && request.resource.data.timestamp is int;
+          && isNumeric(request.resource.data.damage)
+          && request.resource.data.damage >= 0 && request.resource.data.damage <= 10000
+          && isNumeric(request.resource.data.timestamp);
       }
     }
   }

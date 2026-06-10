@@ -15,6 +15,53 @@ import {
 import firebaseConfig from '../../firebase-applet-config.json';
 import { Player, Faction } from '../types';
 
+export enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+export interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId?: string | null;
+    email?: string | null;
+    emailVerified?: boolean | null;
+    isAnonymous?: boolean | null;
+    tenantId?: string | null;
+    providerInfo?: {
+      providerId?: string | null;
+      email?: string | null;
+    }[];
+  }
+}
+
+export function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth?.currentUser?.uid || null,
+      email: auth?.currentUser?.email || null,
+      emailVerified: auth?.currentUser?.emailVerified || null,
+      isAnonymous: auth?.currentUser?.isAnonymous || null,
+      tenantId: auth?.currentUser?.tenantId || null,
+      providerInfo: auth?.currentUser?.providerData?.map((provider: any) => ({
+        providerId: provider.providerId,
+        email: provider.email,
+      })) || []
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
 let app: any = null;
 export let db: any = null;
 export let auth: any = null;
@@ -76,11 +123,11 @@ export async function syncHeartbeat(
   player: Player & { charName?: string },
   callback: (players: RemotePlayer[]) => void
 ): Promise<void> {
-  if (isFirebaseAvailable && auth && auth.currentUser) {
+  if (isFirebaseAvailable && db) {
     // ----------------------------------------------------
     // TYPE A: FIREBASE SOURCE OF TRUTH
     // ----------------------------------------------------
-    const uid = auth.currentUser.uid;
+    const uid = player.id;
     const playerDocRef = doc(db, 'world_players', uid);
     
     const payload = {
@@ -108,7 +155,7 @@ export async function syncHeartbeat(
         await setDoc(playerDocRef, { ...payload, isInWorld: false }, { merge: true });
       }
     } catch (err) {
-      console.error("Failed to sync heartbeat with Firestore:", err);
+      handleFirestoreError(err, OperationType.WRITE, `world_players/${uid}`);
     }
   } else {
     // ----------------------------------------------------
@@ -146,13 +193,13 @@ export function listenToActivePlayers(
       snapshot.forEach((pDoc) => {
         const u = pDoc.data() as RemotePlayer;
         // Exclude self and verify player is recently active on world map
-        if (u.id !== myId && u.isInWorld && (now - u.lastActive < 10000)) {
+        if (u.id !== myId && u.isInWorld && (now - u.lastActive < 12000)) {
           updatedList.push(u);
         }
       });
       onUpdate(updatedList);
     }, (err) => {
-      console.error("Firestore listenToActivePlayers encountered an error:", err);
+      handleFirestoreError(err, OperationType.LIST, 'world_players');
     });
   } else {
     // Fallback polling loop for Express
@@ -195,7 +242,7 @@ export async function sendAttack(
       const attacksColRef = collection(db, 'world_players', targetId, 'attacks');
       await addDoc(attacksColRef, attackObj);
     } catch (err) {
-      console.error("Firestore sendAttack failed:", err);
+      handleFirestoreError(err, OperationType.CREATE, `world_players/${targetId}/attacks`);
     }
   } else {
     try {
@@ -228,12 +275,12 @@ export function listenToIncomingAttacks(
           try {
             await deleteDoc(change.doc.ref);
           } catch (e) {
-            // Document might already be deleted
+            handleFirestoreError(e, OperationType.DELETE, `world_players/${myId}/attacks/${change.doc.id}`);
           }
         }
       });
     }, (err) => {
-      console.error("Firestore incoming attacks listener failed:", err);
+      handleFirestoreError(err, OperationType.LIST, `world_players/${myId}/attacks`);
     });
   } else {
     // Fallback regular poll on Express server
