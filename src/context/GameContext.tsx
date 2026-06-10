@@ -6,11 +6,12 @@ import { ENEMY_DATA } from '../data/enemies';
 import { ITEM_DATA } from '../data/items';
 import { SKILL_DATA } from '../data/skills';
 import { WORLD_BOSS_DATA } from '../data/worldBoss';
-import { supabase } from '../supabase';
-import { calculateDamage, calculateEnemyDamage, calculateDerivedStats } from '../utils/combatUtils';
+import { calculateDamage, calculateEnemyDamage, calculateDerivedStats, calculateLineageRegen } from '../utils/combatUtils';
+import { calculateEnhancement } from '../utils/enhancement';
 import { handleExperienceGain } from '../logic/levelingLogic';
 import { processAdventureCombat } from '../logic/adventureCombatLogic';
 import { processWorldCombat } from '../logic/worldCombatLogic';
+import { syncHeartbeat, listenToActivePlayers, listenToIncomingAttacks, sendAttack } from '../lib/firebase';
 
 interface SubMapEnemy extends Enemy {
   instanceId: string;
@@ -31,11 +32,12 @@ interface GameContextType extends GameState {
   useItem: (instanceId: string) => void;
   equipItem: (instanceId: string) => void;
   unequipItem: (slot: keyof Player['equipment']) => void;
-  enhanceItem: (scrollInstanceId: string, targetInstanceId: string) => void;
+  enhanceItem: (scrollInstanceId: string, targetInstanceId: string) => { success: boolean; destroyed: boolean; message: string } | undefined;
   setQuickItem: (slot: number, itemId: string | null) => void;
   setQuickSkill: (slot: number, skillId: string | null) => void;
   useQuickItem: (slot: number) => void;
   toggleAutoAttack: () => void;
+  toggleAutoPlay: () => void;
   restAtInn: () => void;
   buyItem: (itemId: string) => void;
   sellItem: (itemId: string) => void;
@@ -59,6 +61,12 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (savedData) {
       try {
         const parsed = JSON.parse(savedData);
+        if (parsed) {
+          if (!parsed.quickSkills) parsed.quickSkills = [];
+          while (parsed.quickSkills.length < 8) parsed.quickSkills.push(null);
+          if (!parsed.quickItems) parsed.quickItems = [];
+          while (parsed.quickItems.length < 8) parsed.quickItems.push(null);
+        }
         return {
           player: parsed,
           currentMap: null,
@@ -69,6 +77,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
           selectedEnemyInstanceId: null,
           combatLogs: ['歡迎回來！冒險者。'],
           isAutoAttacking: false,
+          isAutoPlay: true,
           activeBuffs: [],
           cooldowns: {},
           attackProgress: 0,
@@ -92,6 +101,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       selectedEnemyInstanceId: null,
       combatLogs: [],
       isAutoAttacking: false,
+      isAutoPlay: true,
       activeBuffs: [],
       cooldowns: {},
       attackProgress: 0,
@@ -103,768 +113,208 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     };
   });
 
-  // Supabase Auth & Initial Player Fetch
-  useEffect(() => {
-    const initAuth = async () => {
-      try {
-        let currentUser = null;
-        const { data: { session } } = await supabase.auth.getSession();
-        if (session?.user) {
-          currentUser = session.user;
-        } else {
-          const { data: { user: newUser }, error } = await supabase.auth.signInAnonymously();
-          if (error) throw error;
-          currentUser = newUser;
-        }
-        
-        if (currentUser) {
-          setUser(currentUser);
-          // Fetch latest player data from Supabase to overwrite stale localStorage
-          const { data: dbPlayer } = await supabase
-            .from('users')
-            .select('*')
-            .eq('id', currentUser.id)
-            .single();
-          
-          if (dbPlayer) {
-            console.log('Initial Player Data Fetched from DB:', dbPlayer);
-            setState(prev => {
-              const mappedPlayer: Player = {
-                ...(prev.player || {}),
-                ...dbPlayer,
-                id: dbPlayer.name || prev.player?.id || '未知角色', // db.name is the character name
-                uid: dbPlayer.id, // db.id is the UUID
-                stats: typeof dbPlayer.stats === 'string' ? JSON.parse(dbPlayer.stats) : dbPlayer.stats,
-                inventory: typeof dbPlayer.inventory === 'string' ? JSON.parse(dbPlayer.inventory) : dbPlayer.inventory,
-                equipment: typeof dbPlayer.equipment === 'string' ? JSON.parse(dbPlayer.equipment) : dbPlayer.equipment,
-              } as Player;
+  const playerRef = React.useRef(state.player);
 
-              lastSyncedHpRef.current = mappedPlayer.hp;
+  useEffect(() => {
+    playerRef.current = state.player;
+  }, [state.player]);
+
+  // Offline-First Auth & Local Player Fetch
+  useEffect(() => {
+    const initAuth = () => {
+      try {
+        let currentUserId = localStorage.getItem('rpg_game_user_id');
+        if (!currentUserId) {
+          currentUserId = 'char_' + Math.random().toString(36).substring(2, 11);
+          localStorage.setItem('rpg_game_user_id', currentUserId);
+        }
+        const currentUser = { id: currentUserId, email: 'adventure_player@game.com' };
+        setUser(currentUser);
+        
+        const savedData = localStorage.getItem(STORAGE_KEY);
+        if (savedData) {
+          setState(prev => {
+            if (prev.player) {
               return {
                 ...prev,
-                player: mappedPlayer
-              };
-            });
-          }
-        }
-      } catch (err) {
-        console.error('Auth initialization failed:', err);
-      }
-    };
-
-    const { data: { subscription: authListener } } = supabase.auth.onAuthStateChange((event, session) => {
-      if (session?.user) {
-        setUser(session.user);
-      } else if (event === 'SIGNED_OUT') {
-        setUser(null);
-        // Re-sign in anonymously if signed out
-        supabase.auth.signInAnonymously();
-      }
-    });
-
-    initAuth();
-
-    return () => {
-      authListener.unsubscribe();
-    };
-  }, []);
-
-  // Supabase User Sync (Real-time)
-  useEffect(() => {
-    if (!user || !state.player?.isInWorld) return;
-
-    const channelId = `user-sync-${user.id}`;
-    const userChannel = supabase
-      .channel(channelId)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'users',
-          filter: `id=eq.${user.id}`
-        },
-        (payload) => {
-          if (payload.eventType === 'DELETE') {
-            setState(prev => ({ ...prev, player: null }));
-            return;
-          }
-
-          const data = payload.new as any;
-          if (!data) return;
-          
-          setState(prev => {
-            if (!prev.player) return prev;
-
-            const remotePlayerHp = data.hp;
-            const remoteLastAttackerName = data.lastAttackerName;
-            
-            const hpChanged = remotePlayerHp !== prev.player.hp;
-            const isExternalDamage = remotePlayerHp < prev.player.hp && remotePlayerHp < (lastSyncedHpRef.current ?? Infinity);
-
-            if (hpChanged) {
-              console.log('User Sync HP Update:', { remoteHp: remotePlayerHp, isExternalDamage });
-              
-              let nextState = { 
-                ...prev, 
-                player: { 
-                  ...prev.player, 
-                  hp: remotePlayerHp,
-                  lastAttackerName: remoteLastAttackerName || prev.player.lastAttackerName
-                } 
-              };
-
-              // Auto-retaliate if external damage and not in combat
-              if (isExternalDamage && !prev.inCombat && remoteLastAttackerName) {
-                const attacker = prev.worldPlayers.find(p => p.id === remoteLastAttackerName || p.name === remoteLastAttackerName);
-                if (attacker) {
-                  const otherPlayerDerived = calculateDerivedStats(attacker, []);
-                  let otherPlayerAtk = otherPlayerDerived.meleeAtk;
-                  if (attacker.class === CharacterClass.ELF) otherPlayerAtk = otherPlayerDerived.rangedAtk;
-                  if (attacker.class === CharacterClass.MAGE) otherPlayerAtk = otherPlayerDerived.magicAtk;
-
-                  const attackerEnemy = {
-                    id: attacker.id,
-                    name: attacker.name || `玩家 (${attacker.faction})`,
-                    type: 'normal' as const,
-                    hp: attacker.hp,
-                    maxHp: attacker.maxHp,
-                    mp: attacker.mp,
-                    maxMp: attacker.maxMp,
-                    atk: otherPlayerAtk,
-                    def: otherPlayerDerived.physDef,
-                    range: 1,
-                    exp: 100,
-                    gold: 50,
-                    behavior: 'passive' as const,
-                    respawnTime: 10,
-                    dropTable: [],
-                    instanceId: `player-${attacker.id}`,
-                    distance: 1, 
-                    respawnTimer: 0,
-                    isPlayer: true,
-                    faction: attacker.faction,
-                    targetUid: attacker.id,
-                  };
-
-                  nextState = {
-                    ...nextState,
-                    inCombat: true,
-                    currentEnemy: attackerEnemy,
-                    selectedEnemyInstanceId: attackerEnemy.instanceId,
-                    isAutoAttacking: true
-                  };
+                player: {
+                  ...prev.player,
+                  uid: currentUser.id
                 }
-              }
-              
-              lastSyncedHpRef.current = remotePlayerHp;
-              return nextState;
+              };
             }
             return prev;
           });
         }
-      )
-      .subscribe((status) => {
-        console.log(`User Sync Channel Status for ${user.id}:`, status);
-      });
-
-    return () => {
-      supabase.removeChannel(userChannel);
-    };
-  }, [user, state.player?.isInWorld]);
-
-  // Handle offline/leave
-  useEffect(() => {
-    const handleBeforeUnload = async () => {
-      if (user) {
-        // Broadcast leave for immediate visibility update for others
-        const worldChannel = (window as any).worldChannel;
-        if (worldChannel) {
-          worldChannel.send({
-            type: 'broadcast',
-            event: 'player_leave',
-            payload: { playerId: user.id }
-          });
-        }
-        await supabase.from('users').update({ 
-          isInWorld: false, 
-          lastUpdate: new Date().toISOString() 
-        }).eq('id', user.id);
+      } catch (err) {
+        console.error('Player initialization failed:', err);
       }
     };
-    window.addEventListener('beforeunload', handleBeforeUnload);
-    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
-  }, [user]);
 
-  // Listen for World Logs - ONLY when in world
-  useEffect(() => {
-    if (!state.player?.isInWorld) return;
+    initAuth();
+  }, []);
 
-    const logsChannel = supabase
-      .channel('world-logs')
-      .on(
-        'postgres_changes',
-        {
-          event: 'INSERT',
-          schema: 'public',
-          table: 'world_logs'
-        },
-        (payload) => {
-          const logData = payload.new as any;
-          setState(prev => {
-            if (prev.combatLogs.includes(logData.text)) return prev;
-            return {
-              ...prev,
-              combatLogs: [logData.text, ...prev.combatLogs].slice(0, 50)
-            };
-          });
-        }
-      )
-      .subscribe();
-
-    // Initial logs fetch
-    supabase.from('world_logs')
-      .select('*')
-      .order('created_at', { ascending: false })
-      .limit(10)
-      .then(({ data }) => {
-        if (data) {
-          setState(prev => {
-            const newLogs = data.map(l => l.text).filter(t => !prev.combatLogs.includes(t));
-            return {
-              ...prev,
-              combatLogs: [...newLogs, ...prev.combatLogs].slice(0, 50)
-            };
-          });
-        }
-      });
-
-    return () => {
-      supabase.removeChannel(logsChannel);
-    };
-  }, [state.player?.isInWorld]);
-
-  // Supabase World Sync
+  // Real-Time PvP Multiplayer Synchronization Listeners
   useEffect(() => {
     if (!state.player?.isInWorld || !user) return;
 
-    const fetchInitialWorldData = async () => {
-      const { data: bossData } = await supabase.from('world_boss').select('*').eq('id', 'boss').single();
-      const { data: allPlayers } = await supabase.from('users').select('*').eq('deleted', false);
-      
+    // Use our unique user identifier (uid) as active key
+    const myId = state.player.uid || state.player.id || user.id;
+
+    console.log("PVP system activated for player:", myId);
+
+    // 1. Listen to active world players
+    const unsubscribePlayers = listenToActivePlayers(myId, (remotePlayers) => {
+      // Map RemotePlayer data format to SubMapEnemy shape to register them on map
+      const mappedEnemies = remotePlayers.map(p => {
+        return {
+          id: p.id,
+          name: p.name,
+          type: 'normal' as const,
+          hp: p.hp,
+          maxHp: p.maxHp,
+          mp: p.mp,
+          maxMp: p.maxMp,
+          atk: p.atk,
+          def: p.def,
+          range: p.class === CharacterClass.ELF ? 6 : 1,
+          exp: 200,
+          gold: 100,
+          behavior: 'passive' as const,
+          respawnTime: 10,
+          dropTable: [],
+          instanceId: p.id, // Target player UID forms instanceId
+          distance: 10,
+          respawnTimer: 0,
+          isPlayer: true,
+          faction: p.faction,
+          targetUid: p.id,
+        };
+      });
+
       setState(prev => {
-        const players = allPlayers || [];
-        const boss = bossData || prev.worldBoss;
-        
-        const playerEnemies = players
-          .filter(p => p.id !== user.id && p.isInWorld)
-          .map(p => {
-            const otherPlayerDerived = calculateDerivedStats(p as Player, []);
-            let otherPlayerAtk = otherPlayerDerived.meleeAtk;
-            if (p.class === CharacterClass.ELF) otherPlayerAtk = otherPlayerDerived.rangedAtk;
-            if (p.class === CharacterClass.MAGE) otherPlayerAtk = otherPlayerDerived.magicAtk;
+        if (!prev.player) return prev;
 
-            return {
-              id: p.id,
-              name: p.name || `玩家 (${p.faction})`,
-              type: 'normal',
-              hp: p.hp,
-              maxHp: p.maxHp,
-              mp: p.mp,
-              maxMp: p.maxMp,
-              atk: otherPlayerAtk,
-              def: otherPlayerDerived.physDef,
-              range: 1,
-              exp: 100,
-              gold: 50,
-              behavior: 'passive',
-              respawnTime: 10,
-              dropTable: [],
-              instanceId: `player-${p.id}`,
-              distance: 15,
-              respawnTimer: 0,
-              isPlayer: true,
-              faction: p.faction,
-              targetUid: p.id,
-            };
-          });
+        // Sync target details if we are locked in PvP
+        let nextEnemy = prev.currentEnemy;
+        let nextInCombat = prev.inCombat;
+        let nextSelectedId = prev.selectedEnemyInstanceId;
 
-        const bossEnemy = boss ? {
-          ...WORLD_BOSS_DATA,
-          hp: boss.hp,
-          maxHp: boss.maxHp,
-          instanceId: 'world_boss',
-          distance: 15,
-          respawnTimer: boss.status === 'active' ? 0 : 1,
-        } : null;
+        if (prev.inCombat && prev.currentEnemy) {
+          const match = mappedEnemies.find(e => e.instanceId === prev.currentEnemy.instanceId);
+          if (!match || match.hp <= 0) {
+            // Target player was defeated or went offline
+            nextEnemy = null;
+            nextInCombat = false;
+            nextSelectedId = null;
+            if (prev.isAutoPlay) {
+              const eligible = mappedEnemies.filter(e => e.hp > 0 && e.faction !== prev.player!.faction);
+              if (eligible.length > 0) {
+                nextEnemy = eligible[0];
+                nextInCombat = true;
+                nextSelectedId = eligible[0].instanceId;
+              }
+            }
+          } else {
+            nextEnemy = match;
+          }
+        }
 
         return {
           ...prev,
-          worldBoss: boss,
-          worldPlayers: players,
-          worldEnemies: bossEnemy ? [bossEnemy, ...playerEnemies] : playerEnemies
+          worldPlayers: remotePlayers,
+          worldEnemies: mappedEnemies,
+          currentEnemy: nextEnemy,
+          inCombat: nextInCombat,
+          selectedEnemyInstanceId: nextSelectedId,
         };
       });
-    };
+    });
 
-    fetchInitialWorldData();
+    // 2. Listen to incoming attacks directed at ME
+    const unsubscribeAttacks = listenToIncomingAttacks(myId, (attack) => {
+      setState(prev => {
+        if (!prev.player || !prev.player.isInWorld) return prev;
 
-    // ✅ World Boss Realtime
-    const bossChannel = supabase
-      .channel(`world-boss-${user.id}`)
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'world_boss',
-          filter: 'id=eq.boss'
-        },
-        (payload) => {
-          const bossData = payload.new as any;
+        const nextHp = Math.max(0, prev.player.hp - attack.damage);
+        const nextLogs = [`[受到攻擊] 玩家 ${attack.attackerName} 對你造成了 ${attack.damage} 點傷害！`, ...prev.combatLogs].slice(0, 50);
 
-          setState(prev => {
-            const localBoss = prev.currentEnemy?.instanceId === 'world_boss' ? prev.currentEnemy : null;
-            const bossHp = (localBoss && localBoss.hp < bossData.hp && (bossData.hp - localBoss.hp < 100)) ? localBoss.hp : bossData.hp;
+        let nextPlayer = {
+          ...prev.player,
+          hp: nextHp,
+          lastAttackerName: attack.attackerName,
+        };
 
-            const bossEnemy = {
-              ...WORLD_BOSS_DATA,
-              hp: bossHp,
-              maxHp: bossData.maxHp,
-              instanceId: 'world_boss',
-              distance: prev.currentEnemy?.instanceId === 'world_boss' ? prev.currentEnemy.distance : 15,
-              respawnTimer: bossData.status === 'active' ? 0 : 1,
-            };
+        let nextInCombat = prev.inCombat;
+        let nextEnemy = prev.currentEnemy;
+        let nextSelectedId = prev.selectedEnemyInstanceId;
 
-            const playerEnemies = prev.worldPlayers
-              .filter(p => p.id !== user.id && !p.deleted && p.isInWorld)
-              .map(p => {
-                const otherPlayerDerived = calculateDerivedStats(p as Player, []);
-                let otherPlayerAtk = otherPlayerDerived.meleeAtk;
-                if (p.class === CharacterClass.ELF) otherPlayerAtk = otherPlayerDerived.rangedAtk;
-                if (p.class === CharacterClass.MAGE) otherPlayerAtk = otherPlayerDerived.magicAtk;
-
-              const localEnemy = prev.currentEnemy?.instanceId === `player-${p.id}` ? prev.currentEnemy : null;
-              // If database HP is significantly higher than local HP, it's likely a heal, so accept it.
-              // We use 20 as a threshold (potions heal 50).
-              const currentHp = (localEnemy && localEnemy.hp < p.hp && (p.hp - localEnemy.hp < 20)) 
-                ? localEnemy.hp 
-                : p.hp;
-
-              return {
-                id: p.id,
-                name: p.name || `玩家 (${p.faction})`,
-                type: 'normal',
-                hp: currentHp,
-                maxHp: p.maxHp,
-                  mp: p.mp,
-                  maxMp: p.maxMp,
-                  atk: otherPlayerAtk,
-                  def: otherPlayerDerived.physDef,
-                  range: 1,
-                  exp: 100,
-                  gold: 50,
-                  behavior: 'passive',
-                  respawnTime: 10,
-                  dropTable: [],
-                  instanceId: `player-${p.id}`,
-                  distance: prev.currentEnemy?.instanceId === `player-${p.id}` ? prev.currentEnemy.distance : 15,
-                  respawnTimer: 0,
-                  isPlayer: true,
-                  faction: p.faction,
-                  targetUid: p.id,
-                };
-              });
-
-            return {
-              ...prev,
-              worldBoss: bossData,
-              worldEnemies: [bossEnemy, ...playerEnemies]
-            };
-          });
+        // Auto retaliation if autoplay is on
+        if (!prev.inCombat && prev.isAutoPlay) {
+          const attackerMatch = prev.worldEnemies.find(e => e.id === attack.attackerUid && e.hp > 0);
+          if (attackerMatch && attackerMatch.faction !== prev.player.faction) {
+            nextEnemy = attackerMatch;
+            nextInCombat = true;
+            nextSelectedId = attackerMatch.instanceId;
+            nextLogs.unshift(`[反擊] 自動鎖定反擊對象：${attackerMatch.name}`);
+          }
         }
-      )
-      .subscribe();
 
-    // ✅ Players Realtime & Broadcasts (Shared channel for broadcasts)
-    const playersChannel = supabase
-      .channel('world-map-global')
-      .on(
-        'postgres_changes',
-        {
-          event: '*',
-          schema: 'public',
-          table: 'users'
-        },
-        (payload) => {
-          const newData = payload.new as any;
-          console.log('Players Channel Payload Received:', payload.eventType, newData?.id);
+        if (nextHp <= 0) {
+          const nextDeaths = (prev.player.pvpDeaths || 0) + 1;
+          nextLogs.unshift(`[PVP] 你被玩家 ${attack.attackerName} 擊敗了... 回到了旅館。`);
           
-          setState(prev => {
-            let updatedPlayers = [...prev.worldPlayers];
-            const oldData = payload.old as any;
-
-            if (payload.eventType === 'INSERT') {
-              if (!updatedPlayers.find(p => p.id === newData.id)) {
-                updatedPlayers.push({ ...newData, lastSeen: Date.now() });
-              }
-            } else if (payload.eventType === 'UPDATE') {
-              const index = updatedPlayers.findIndex(p => p.id === newData.id);
-              if (index !== -1) {
-                // Merge new data into existing player object
-                updatedPlayers[index] = { 
-                  ...updatedPlayers[index], 
-                  ...newData,
-                  lastSeen: Date.now() 
-                };
-              } else if (newData.isInWorld) {
-                // If not in list but now in world, add them
-                updatedPlayers.push({ ...newData, lastSeen: Date.now() });
-              }
-            } else if (payload.eventType === 'DELETE') {
-              updatedPlayers = updatedPlayers.filter(p => p.id !== oldData.id);
-            }
-
-            // Filter for players currently in world
-            // Be robust: check isInWorld explicitly, and also filter out stale players
-            const now = Date.now();
-            
-            // Periodic cleanup of the main worldPlayers state to prevent memory bloat
-            const cleanedWorldPlayers = updatedPlayers.filter(p => 
-              p.lastSeen ? (now - p.lastSeen < 120000) : true // 2 min hard timeout for state
-            );
-
-            const inWorldPlayers = cleanedWorldPlayers.filter(p => 
-              p.id !== user.id && 
-              p.isInWorld === true && 
-              !p.deleted &&
-              (p.lastSeen ? (now - p.lastSeen < 60000) : true) // 60s timeout for visibility
-            );
-
-            const playerEnemies = inWorldPlayers.map(p => {
-              const otherPlayerDerived = calculateDerivedStats(p as Player, []);
-              let otherPlayerAtk = otherPlayerDerived.meleeAtk;
-              if (p.class === CharacterClass.ELF) otherPlayerAtk = otherPlayerDerived.rangedAtk;
-              if (p.class === CharacterClass.MAGE) otherPlayerAtk = otherPlayerDerived.magicAtk;
-
-              const localEnemy = prev.currentEnemy?.instanceId === `player-${p.id}` ? prev.currentEnemy : null;
-              // If database HP is significantly higher than local HP, it's likely a heal, so accept it.
-              const currentHp = (localEnemy && localEnemy.hp < p.hp && (p.hp - localEnemy.hp < 20)) 
-                ? localEnemy.hp 
-                : p.hp;
-
-              return {
-                id: p.id,
-                name: p.name || `玩家 (${p.faction})`,
-                type: 'normal' as const,
-                hp: currentHp,
-                maxHp: p.maxHp,
-                mp: p.mp,
-                maxMp: p.maxMp,
-                atk: otherPlayerAtk,
-                def: otherPlayerDerived.physDef,
-                range: 1,
-                exp: 100,
-                gold: 50,
-                behavior: 'passive' as const,
-                respawnTime: 10,
-                dropTable: [],
-                instanceId: `player-${p.id}`,
-                distance: prev.currentEnemy?.instanceId === `player-${p.id}` ? prev.currentEnemy.distance : 15,
-                respawnTimer: 0,
-                isPlayer: true,
-                faction: p.faction,
-                targetUid: p.id,
-              };
-            });
-
-            const bossData = prev.worldBoss;
-            const localBoss = prev.currentEnemy?.instanceId === 'world_boss' ? prev.currentEnemy : null;
-            const bossHp = (bossData && localBoss && localBoss.hp < bossData.hp && (bossData.hp - localBoss.hp < 100)) ? localBoss.hp : (bossData?.hp || 0);
-
-            const bossEnemy = bossData
-              ? {
-                  ...WORLD_BOSS_DATA,
-                  hp: bossHp,
-                  maxHp: bossData.maxHp,
-                  instanceId: 'world_boss',
-                  distance: prev.currentEnemy?.instanceId === 'world_boss' ? prev.currentEnemy.distance : 15,
-                  respawnTimer: bossData.status === 'active' ? 0 : 1,
-                }
-              : null;
-
-            return {
-              ...prev,
-              worldPlayers: cleanedWorldPlayers,
-              worldEnemies: bossEnemy ? [bossEnemy, ...playerEnemies] : playerEnemies
-            };
-          });
-        }
-      )
-      .on(
-        'broadcast',
-        { event: 'pvp_damage' },
-        (payload) => {
-          const { victimId, attackerName, damage, newHp } = payload.payload;
-          if (victimId === user.id) {
-            const timestamp = new Date().toLocaleTimeString();
-            const pvpLog = `[${timestamp}] 你受到了來自 ${attackerName} 的 ${damage} 點傷害！ (廣播)`;
-            console.log('PvP Broadcast Received:', pvpLog);
-            
-            setState(prev => {
-              if (!prev.player) return prev;
-              // Use local HP minus damage to ensure heals are preserved.
-              // The attacker's newHp might be based on stale data.
-              const updatedHp = Math.max(0, prev.player.hp - (damage || 0));
-              
-              // Also update the sync ref to prevent the next sync from overwriting this damage
-              lastSyncedHpRef.current = updatedHp;
-              
-              return {
-                ...prev,
-                player: { ...prev.player, hp: updatedHp },
-                combatLogs: [pvpLog, ...prev.combatLogs].slice(0, 50)
-              };
-            });
-          } else {
-            // If we are attacking this person, update our local enemy state immediately
-            setState(prev => {
-              if (prev.currentEnemy?.targetUid === victimId) {
-                return {
-                  ...prev,
-                  currentEnemy: {
-                    ...prev.currentEnemy,
-                    hp: Math.max(0, newHp !== undefined ? newHp : prev.currentEnemy.hp - damage)
-                  }
-                };
-              }
-              return prev;
-            });
-          }
-        }
-      )
-      .on(
-        'broadcast',
-        { event: 'pvp_heal' },
-        (payload) => {
-          const { playerId, playerName, newHp } = payload.payload;
-          if (playerId !== user.id) {
-            console.log('PvP Heal Broadcast Received:', playerName, newHp);
-            setState(prev => {
-              // Update worldPlayers
-              const updatedWorldPlayers = prev.worldPlayers.map(p => 
-                p.id === playerId ? { ...p, hp: newHp } : p
-              );
-
-              // Update currentEnemy if it's the one who healed
-              let updatedCurrentEnemy = prev.currentEnemy;
-              if (prev.currentEnemy?.targetUid === playerId) {
-                updatedCurrentEnemy = {
-                  ...prev.currentEnemy,
-                  hp: newHp
-                };
-              }
-
-              return {
-                ...prev,
-                worldPlayers: updatedWorldPlayers,
-                currentEnemy: updatedCurrentEnemy
-              };
-            });
-          }
-        }
-      )
-      .on(
-        'broadcast',
-        { event: 'pvp_death' },
-        (payload) => {
-          const { playerId, playerName, attackerName } = payload.payload;
-          if (playerId !== user.id) {
-            console.log('PvP Death Broadcast Received:', playerName, 'killed by', attackerName);
-            
-            const isAttacker = attackerName === state.player?.id;
-            const timestamp = new Date().toLocaleTimeString();
-            const logMsg = isAttacker 
-              ? `[${timestamp}] 你擊敗了玩家 ${playerName}！ (廣播)`
-              : `[${timestamp}] 玩家 ${playerName} 被 ${attackerName} 擊敗了。`;
-
-            setState(prev => {
-              // Update worldPlayers: remove them or set HP to 0
-              const updatedWorldPlayers = prev.worldPlayers.filter(p => p.id !== playerId);
-
-              // If we were attacking them, stop and show log
-              let updatedEnemy = prev.currentEnemy;
-              let updatedInCombat = prev.inCombat;
-              let updatedAutoAttacking = prev.isAutoAttacking;
-              let updatedLogs = [...prev.combatLogs];
-
-              if (prev.currentEnemy?.targetUid === playerId) {
-                updatedEnemy = null;
-                updatedInCombat = false;
-                updatedAutoAttacking = false;
-                updatedLogs = [logMsg, ...prev.combatLogs].slice(0, 50);
-              }
-
-              // Also update pvpKills if we are the attacker
-              const updatedPlayer = isAttacker && prev.player 
-                ? { ...prev.player, pvpKills: (prev.player.pvpKills || 0) + 1 }
-                : prev.player;
-
-              return {
-                ...prev,
-                player: updatedPlayer,
-                worldPlayers: updatedWorldPlayers,
-                currentEnemy: updatedEnemy,
-                inCombat: updatedInCombat,
-                isAutoAttacking: updatedAutoAttacking,
-                combatLogs: updatedLogs
-              };
-            });
-          }
-        }
-      )
-      .on(
-        'broadcast',
-        { event: 'player_leave' },
-        (payload) => {
-          const { playerId } = payload.payload;
-          console.log('Player Leave Broadcast Received:', playerId);
-          setState(prev => ({
+          return {
             ...prev,
-            worldPlayers: prev.worldPlayers.filter(p => p.id !== playerId)
-          }));
+            player: {
+              ...prev.player,
+              hp: Math.floor(prev.player.maxHp * 0.5),
+              isInWorld: false,
+              pvpDeaths: nextDeaths,
+            },
+            currentMap: null,
+            currentSubMap: null,
+            subMapEnemies: [],
+            inCombat: false,
+            currentEnemy: null,
+            selectedEnemyInstanceId: null,
+            combatLogs: nextLogs,
+          };
         }
-      )
-      .subscribe((status) => {
-        console.log(`World Sync Channel Status for ${user.id}:`, status);
-        if (status === 'SUBSCRIBED') {
-          // Store channel in ref for broadcasting
-          (window as any).worldChannel = playersChannel;
-        }
+
+        return {
+          ...prev,
+          player: nextPlayer,
+          combatLogs: nextLogs,
+          inCombat: nextInCombat,
+          currentEnemy: nextEnemy,
+          selectedEnemyInstanceId: nextSelectedId,
+        };
       });
+    });
+
+    // 3. Periodic player heartbeat stats sync (runs every 1500ms)
+    const heartbeatTimer = setInterval(() => {
+      const activePlayer = playerRef.current;
+      if (activePlayer && activePlayer.isInWorld) {
+        const syncId = activePlayer.uid || activePlayer.id || user.id;
+        // Ensure we sync matching ID and preserve original character name
+        const playerToSync = { 
+          ...activePlayer, 
+          id: syncId,
+          charName: activePlayer.id
+        };
+        syncHeartbeat(playerToSync, () => {});
+      }
+    }, 1500);
 
     return () => {
-      supabase.removeChannel(bossChannel);
-      supabase.removeChannel(playersChannel);
-      (window as any).worldChannel = null;
+      console.log("PVP system deactivated.");
+      unsubscribePlayers();
+      unsubscribeAttacks();
+      clearInterval(heartbeatTimer);
     };
-  }, [state.player?.isInWorld, user?.id]);
-
-  // Sync player to Supabase - ONLY when in world (or just left)
-  useEffect(() => {
-    const syncPlayer = async () => {
-      if (!state.player || !user) return;
-      
-      const now = Date.now();
-      const isCriticalChange = state.player.hp <= 0 || state.player.isInWorld !== lastInWorldRef.current;
-      
-      // If player just left the world, broadcast it for immediate visibility update
-      if (lastInWorldRef.current === true && state.player.isInWorld === false) {
-        const worldChannel = (window as any).worldChannel;
-        if (worldChannel) {
-          worldChannel.send({
-            type: 'broadcast',
-            event: 'player_leave',
-            payload: { playerId: user.id }
-          });
-        }
-      }
-      
-      if (isCriticalChange) {
-        console.log('Critical Sync Triggered:', { 
-          hp: state.player.hp, 
-          isInWorld: state.player.isInWorld, 
-          prevInWorld: lastInWorldRef.current 
-        });
-      }
-
-      // Debounce non-critical syncs (max once per 2 seconds)
-      if (!isCriticalChange && now - lastSyncedAtRef.current < 2000) {
-        return;
-      }
-
-      // Only sync if currently in world OR if we just left the world
-      if (!state.player.isInWorld && !lastInWorldRef.current) return;
-      
-      const prevInWorld = lastInWorldRef.current;
-      lastInWorldRef.current = state.player.isInWorld;
-      
-      const currentHp = state.player.hp;
-      const prevSyncedHp = lastSyncedHpRef.current;
-
-      // 🛡️ HP Sync Protection:
-      // If in world map and HP decreased, don't sync HP in this debounced loop.
-      // This prevents local state from overwriting PvP damage before the listener can process it.
-      // We only sync HP if it increased (healing/regen) or if we are not in the world map (adventure combat).
-      const isHealing = currentHp > (prevSyncedHp ?? 0);
-      const shouldSyncHp = !state.player.isInWorld || isHealing;
-
-      // Sync player to Supabase using the exact schema provided by the user
-      const syncData: any = { 
-        id: user.id, 
-        name: state.player.id, // Use character ID as name in database
-        class: state.player.class,
-        faction: state.player.faction,
-        level: state.player.level,
-        exp: state.player.exp,
-        nextLevelExp: state.player.nextLevelExp,
-        hp: currentHp,
-        maxHp: state.player.maxHp,
-        mp: state.player.mp,
-        maxMp: state.player.maxMp,
-        gold: state.player.gold,
-        pvpKills: state.player.pvpKills,
-        pvpDeaths: state.player.pvpDeaths,
-        isInWorld: state.player.isInWorld,
-        inventory: state.player.inventory,
-        equipment: state.player.equipment,
-        stats: state.player.stats,
-        skills: state.player.skills,
-        quickItems: state.player.quickItems,
-        quickSkills: state.player.quickSkills,
-        autoSkills: state.player.autoSkills,
-        lastAttackerName: state.player.lastAttackerName || null,
-        deleted: state.player.deleted || false,
-        lastUpdate: new Date().toISOString()
-      };
-
-      if (!shouldSyncHp) {
-        console.log('Skipping HP sync to prevent overwriting damage:', { currentHp, prevSyncedHp });
-        delete syncData.hp;
-      }
-
-      // If we are in the world, use a conditional update to avoid overwriting PvP damage.
-      if (prevSyncedHp !== null && state.player.isInWorld && prevInWorld) {
-        const { data, error } = await supabase
-          .from('users')
-          .update(syncData)
-          .eq('id', user.id)
-          .eq('hp', prevSyncedHp)
-          .select();
-
-        if (error) {
-          if (error.code === 'PGRST116') {
-            await supabase.from('users').upsert(syncData);
-          } else {
-            console.error('Conditional sync failed:', error);
-          }
-        } else if (!data || data.length === 0) {
-          console.log('HP in DB has changed (PvP damage?), skipping sync to avoid overwrite.');
-          lastSyncedAtRef.current = 0; 
-          return;
-        }
-      } else {
-        await supabase.from('users').upsert(syncData);
-      }
-
-      // Only update the sync ref if we actually synced the HP
-      if (shouldSyncHp) {
-        lastSyncedHpRef.current = currentHp;
-      }
-      lastSyncedAtRef.current = now;
-    };
-    syncPlayer();
-  }, [state.player, user]);
+  }, [state.player?.isInWorld, user]);
 
   // Save to localStorage whenever player data changes
   useEffect(() => {
@@ -876,15 +326,6 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const addLog = useCallback((log: string) => {
     setState(prev => {
       const newLogs = [log, ...prev.combatLogs].slice(0, 50);
-      
-      // If in world, sync log to Supabase
-      if (prev.player?.isInWorld) {
-        supabase.from('world_logs').insert({
-          text: log,
-          faction: prev.player.faction,
-        });
-      }
-
       return {
         ...prev,
         combatLogs: newLogs,
@@ -916,12 +357,12 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     });
 
-    const quickSkills: (string | null)[] = [null, null, null, null];
+    const quickSkills: (string | null)[] = Array(8).fill(null);
     initialSkills.forEach((skillId, i) => {
-      if (i < 4) quickSkills[i] = skillId;
+      if (i < 8) quickSkills[i] = skillId;
     });
 
-    const player: Player = {
+    const tempPlayer: Player = {
       id,
       uid: '', // Will be updated after getting user
       class: charClass,
@@ -929,10 +370,10 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       level: 1,
       exp: 0,
       nextLevelExp: 100,
-      hp: 30 + stats.con * 1,
-      maxHp: 30 + stats.con * 1,
-      mp: 10 + stats.int * 1,
-      maxMp: 10 + stats.int * 1,
+      hp: 1,
+      maxHp: 1,
+      mp: 1,
+      maxMp: 1,
       stats: { ...baseStats, ...stats },
       meleeAtk: 1 + stats.str * 1.5,
       rangedAtk: 1 + stats.dex * 1.5,
@@ -944,7 +385,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       inventory: stackedInventory,
       skills: initialSkills,
       equipment: {},
-      quickItems: [null, null, null, null],
+      quickItems: Array(8).fill(null),
       quickSkills,
       attackSpeed: 0.5,
       autoPotionHpThreshold: 30,
@@ -953,43 +394,29 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       pvpKills: 0,
       pvpDeaths: 0,
     };
+
+    const derived = calculateDerivedStats(tempPlayer, []);
+    tempPlayer.hp = derived.maxHp;
+    tempPlayer.maxHp = derived.maxHp;
+    tempPlayer.mp = derived.maxMp;
+    tempPlayer.maxMp = derived.maxMp;
+    tempPlayer.meleeAtk = derived.meleeAtk;
+    tempPlayer.rangedAtk = derived.rangedAtk;
+    tempPlayer.magicAtk = derived.magicAtk;
+    tempPlayer.physDef = derived.physDef;
+    tempPlayer.magicDef = derived.magicDef;
+    tempPlayer.evasion = derived.evasion;
+
+    const player = tempPlayer;
     setState(prev => ({ ...prev, player }));
     addLog(`歡迎來到這個世界，${id}！你選擇了${faction}陣營與${charClass}職業。`);
 
-    // Save to Supabase
-    supabase.auth.getUser().then(({ data: { user } }) => {
-      if (user) {
-        const playerWithUid = { ...player, uid: user.id };
-        setState(prev => ({ ...prev, player: playerWithUid }));
-        // Create character in Supabase using the exact schema provided by the user
-        supabase.from('users').upsert({ 
-          id: user.id, 
-          name: player.id,
-          class: player.class,
-          faction: player.faction,
-          level: player.level,
-          exp: player.exp,
-          nextLevelExp: player.nextLevelExp,
-          hp: player.hp,
-          maxHp: player.maxHp,
-          mp: player.mp,
-          maxMp: player.maxMp,
-          gold: player.gold,
-          pvpKills: 0,
-          pvpDeaths: 0,
-          isInWorld: player.isInWorld,
-          inventory: player.inventory,
-          equipment: player.equipment,
-          stats: player.stats,
-          skills: player.skills,
-          quickItems: player.quickItems,
-          quickSkills: player.quickSkills,
-          autoSkills: player.autoSkills,
-          deleted: false,
-          lastUpdate: new Date().toISOString()
-        });
-      }
-    });
+    // Save to localStorage
+    if (user) {
+      const playerWithUid = { ...player, uid: user.id };
+      setState(prev => ({ ...prev, player: playerWithUid }));
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(playerWithUid));
+    }
   };
 
   const selectMap = (mapId: string, subMapId: string) => {
@@ -1032,6 +459,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         currentEnemy: null,
         selectedEnemyInstanceId: null,
         isAutoAttacking: false,
+        isAutoPlay: false, // Default to manual mode when entering adventure map
         timeInMap: 0,
       }));
       addLog(`進入了 ${map.name} - ${subMap.name}`);
@@ -1056,12 +484,16 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         ? (prev.subMapEnemies.find(e => e.instanceId === instanceId) || prev.worldEnemies.find(e => e.instanceId === instanceId))
         : null;
       
+      const shouldStartCombat = enemy && prev.isAutoPlay;
+      const nextInCombat = enemy ? (prev.inCombat || shouldStartCombat) : false;
+      const nextIsAutoAttacking = enemy ? (prev.isAutoAttacking || shouldStartCombat) : false;
+
       return {
         ...prev,
         selectedEnemyInstanceId: instanceId,
         currentEnemy: enemy || null,
-        inCombat: false,
-        isAutoAttacking: false,
+        inCombat: nextInCombat,
+        isAutoAttacking: nextIsAutoAttacking,
       };
     });
   };
@@ -1116,14 +548,28 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         const instance = player.inventory.find(i => i.instanceId === weaponInstanceId);
         if (instance) {
           const item = ITEM_DATA.find(i => i.id === instance.id);
-          if (item && item.range) weaponRange = item.range;
+          if (item) {
+            if (item.range) weaponRange = item.range;
+            if (item.name.includes('弓') || item.id.includes('bow')) {
+              weaponRange = 6;
+            }
+          }
+        } else {
+          const item = ITEM_DATA.find(i => i.id === weaponInstanceId);
+          if (item) {
+            if (item.range) weaponRange = item.range;
+            if (item.name.includes('弓') || item.id.includes('bow')) {
+              weaponRange = 6;
+            }
+          }
         }
       }
       
       const effectiveRange = skill.range || weaponRange;
       
-      if (currentEnemy.distance > effectiveRange) {
-        addLog(`距離太遠！ ${skill.name} 無法觸及敵人。 (距離: ${currentEnemy.distance}m)`);
+      const isWorldMap = player?.isInWorld;
+      if (!isWorldMap && currentEnemy.distance > effectiveRange) {
+        addLog(`距離太遠！ ${skill.name} 無法觸及敵人。 (距離: ${currentEnemy.distance.toFixed(1)}m)`);
         return;
       }
 
@@ -1132,14 +578,16 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       // Use floating damage
       const damage = calculateDamage(result.damage + currentEnemy.def, currentEnemy.def);
       const newEnemyHp = Math.floor(Math.max(0, currentEnemy.hp - damage));
-      addLog(`使用了 ${skill.name}，對 ${currentEnemy.name} 造成了 ${damage} 點傷害！ (距離: ${currentEnemy.distance}m)`);
       
-      // PvP Sync: Update other player's HP in Supabase
-      if (currentEnemy.instanceId.startsWith('player-') && currentEnemy.targetUid) {
-        supabase.from('users').update({ 
-          hp: newEnemyHp, 
-          lastAttackerName: player.id 
-        }).eq('id', currentEnemy.targetUid);
+      if (isWorldMap) {
+        addLog(`使用了 ${skill.name}，對 ${currentEnemy.name} 造成了 ${damage} 點傷害！`);
+      } else {
+        addLog(`使用了 ${skill.name}，對 ${currentEnemy.name} 造成了 ${damage} 點傷害！ (距離: ${currentEnemy.distance.toFixed(1)}m)`);
+      }
+      
+      // PvP Sync: Real-time remote PvP sync
+      if (isWorldMap) {
+        sendAttack(currentEnemy!.id, player.uid || player.id || 'unknown', player.id || '冒險者', damage);
       }
 
       setState(prev => {
@@ -1439,71 +887,95 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   const enhanceItem = (scrollInstanceId: string, targetInstanceId: string) => {
+    if (!state.player) return undefined;
+    
+    const newInventory = [...state.player.inventory];
+    const scrollIndex = newInventory.findIndex(i => i.instanceId === scrollInstanceId);
+    const targetIndex = newInventory.findIndex(i => i.instanceId === targetInstanceId);
+    
+    if (scrollIndex === -1 || targetIndex === -1) return undefined;
+    
+    const scrollInstance = newInventory[scrollIndex];
+    const targetInstance = newInventory[targetIndex];
+    
+    const scrollItem = ITEM_DATA.find(i => i.id === scrollInstance.id);
+    const targetItem = ITEM_DATA.find(i => i.id === targetInstance.id);
+    
+    if (!scrollItem || !targetItem || !scrollItem.isScroll) return undefined;
     let logMsg = '';
+    let result: { success: boolean; destroyed: boolean; message: string } | undefined = undefined;
+    
+    if (scrollItem.scrollType === 'weapon' && targetItem.type !== 'weapon') {
+      logMsg = '此卷軸只能用於武器！';
+      result = { success: false, destroyed: false, message: logMsg };
+      setState(prev => {
+        if (!prev.player) return prev;
+        return { ...prev, combatLogs: [logMsg, ...prev.combatLogs].slice(0, 50) };
+      });
+      return result;
+    }
+    if (scrollItem.scrollType === 'armor' && targetItem.type !== 'armor') {
+      logMsg = '此卷軸只能用於防具！';
+      result = { success: false, destroyed: false, message: logMsg };
+      setState(prev => {
+        if (!prev.player) return prev;
+        return { ...prev, combatLogs: [logMsg, ...prev.combatLogs].slice(0, 50) };
+      });
+      return result;
+    }
+    
+    if (targetInstance.enhancement >= 10) {
+      logMsg = '該裝備已達到最高強化等級！';
+      result = { success: false, destroyed: false, message: logMsg };
+      setState(prev => {
+        if (!prev.player) return prev;
+        return { ...prev, combatLogs: [logMsg, ...prev.combatLogs].slice(0, 50) };
+      });
+      return result;
+    }
+
+    // Consume scroll
+    if (scrollInstance.quantity > 1) {
+      newInventory[scrollIndex] = { ...scrollInstance, quantity: scrollInstance.quantity - 1 };
+    } else {
+      newInventory.splice(scrollIndex, 1);
+    }
+    
+    const { success, destroyed } = calculateEnhancement(targetInstance);
+    
+    let finalInventory = newInventory;
+    if (success) {
+      const newEnhancement = targetInstance.enhancement + 1;
+      finalInventory = finalInventory.map(i => 
+        i.instanceId === targetInstanceId ? { ...i, enhancement: newEnhancement } : i
+      );
+      logMsg = `★ 強化成功 ★ ${getItemNameWithEnhancement(targetItem, { ...targetInstance, enhancement: newEnhancement })}。`;
+      result = { success: true, destroyed: false, message: logMsg };
+    } else {
+      if (destroyed) {
+        finalInventory = finalInventory.filter(i => i.instanceId !== targetInstanceId);
+        logMsg = `強化失敗！ ${getItemNameWithEnhancement(targetItem, targetInstance)} ，裝備竟然消失了！`;
+        result = { success: false, destroyed: true, message: logMsg };
+      } else {
+        logMsg = `強化失敗... ${getItemNameWithEnhancement(targetItem, targetInstance)} 沒有任何改變。`;
+        result = { success: false, destroyed: false, message: logMsg };
+      }
+    }
+
+    const finalLogMsg = logMsg;
+    const finalResult = result;
+    const finalInventoryState = finalInventory;
+
     setState(prev => {
       if (!prev.player) return prev;
-      const newInventory = [...prev.player.inventory];
-      const scrollIndex = newInventory.findIndex(i => i.instanceId === scrollInstanceId);
-      const targetIndex = newInventory.findIndex(i => i.instanceId === targetInstanceId);
       
-      if (scrollIndex === -1 || targetIndex === -1) return prev;
-      
-      const scrollInstance = newInventory[scrollIndex];
-      const targetInstance = newInventory[targetIndex];
-      
-      const scrollItem = ITEM_DATA.find(i => i.id === scrollInstance.id);
-      const targetItem = ITEM_DATA.find(i => i.id === targetInstance.id);
-      
-      if (!scrollItem || !targetItem || !scrollItem.isScroll) return prev;
-      if (scrollItem.scrollType === 'weapon' && targetItem.type !== 'weapon') {
-        logMsg = '此卷軸只能用於武器！';
-        return prev;
-      }
-      if (scrollItem.scrollType === 'armor' && targetItem.type !== 'armor') {
-        logMsg = '此卷軸只能用於防具！';
-        return prev;
-      }
-      
-      if (targetInstance.enhancement >= 10) {
-        logMsg = '該裝備已達到最高強化等級！';
-        return prev;
-      }
-
-      // Consume scroll
-      if (scrollInstance.quantity > 1) {
-        newInventory[scrollIndex] = { ...scrollInstance, quantity: scrollInstance.quantity - 1 };
-      } else {
-        newInventory.splice(scrollIndex, 1);
-      }
-      
-      const successChance = 1.0 - (targetInstance.enhancement * 0.1);
-      const success = Math.random() < successChance;
-      
-      let finalInventory = newInventory;
-      if (success) {
-        const newEnhancement = targetInstance.enhancement + 1;
-        finalInventory = finalInventory.map(i => 
-          i.instanceId === targetInstanceId ? { ...i, enhancement: newEnhancement } : i
-        );
-        logMsg = `強化成功！${getItemNameWithEnhancement(targetItem, { ...targetInstance, enhancement: newEnhancement })}。`;
-      } else {
-        // Destruction chance on failure
-        const destructionChance = targetInstance.enhancement * 0.05; // e.g. +5 has 25% destruction chance on failure
-        if (Math.random() < destructionChance) {
-          finalInventory = finalInventory.filter(i => i.instanceId !== targetInstanceId);
-          logMsg = `強化失敗... ${getItemNameWithEnhancement(targetItem, targetInstance)} 竟然消失了！`;
-        } else {
-          logMsg = `強化失敗... ${getItemNameWithEnhancement(targetItem, targetInstance)} 的強化等級沒有改變。`;
-        }
-      }
-
-      const newPlayer = { ...prev.player, inventory: finalInventory };
+      const newPlayer = { ...prev.player, inventory: finalInventoryState };
       
       // Check if equipped item was destroyed
       const newEquipment = { ...newPlayer.equipment };
       let equipmentChanged = false;
       Object.keys(newEquipment).forEach(slot => {
-        if (newEquipment[slot as keyof Player['equipment']] === targetInstanceId && !finalInventory.find(i => i.instanceId === targetInstanceId)) {
+        if (newEquipment[slot as keyof Player['equipment']] === targetInstanceId && !finalInventoryState.find(i => i.instanceId === targetInstanceId)) {
           newEquipment[slot as keyof Player['equipment']] = undefined;
           equipmentChanged = true;
         }
@@ -1521,9 +993,24 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       newPlayer.attackSpeed = derived.attackSpeed;
       newPlayer.evasion = derived.evasion;
 
-      return { ...prev, player: newPlayer };
+      // Local logging only, no Supabase required
+      if (prev.player?.isInWorld && finalLogMsg) {
+        // Handled locally in the combatLogs array
+      }
+
+      // Add to combat logs synchronously in the same state update
+      const updatedCombatLogs = finalLogMsg 
+        ? [finalLogMsg, ...prev.combatLogs].slice(0, 50) 
+        : prev.combatLogs;
+
+      return { 
+        ...prev, 
+        player: newPlayer,
+        combatLogs: updatedCombatLogs
+      };
     });
-    if (logMsg) addLog(logMsg);
+
+    return finalResult;
   };
 
   const setQuickItem = (slot: number, itemId: string | null) => {
@@ -1588,14 +1075,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const deleteCharacter = async () => {
     try {
-      if (user) {
-        addLog('正在從雲端刪除角色...');
-        // Soft delete from Supabase
-        await supabase
-          .from('users')
-          .update({ deleted: true })
-          .eq('id', user.id);
-      }
+      addLog('正在刪除角色...');
       
       localStorage.removeItem(STORAGE_KEY);
       
@@ -1634,6 +1114,17 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setState(prev => ({ ...prev, isAutoAttacking: !prev.isAutoAttacking }));
   };
 
+  const toggleAutoPlay = () => {
+    setState(prev => {
+      const nextPlay = !prev.isAutoPlay;
+      return { 
+        ...prev, 
+        isAutoPlay: nextPlay,
+        isAutoAttacking: nextPlay ? true : prev.isAutoAttacking
+      };
+    });
+  };
+
   const restAtInn = () => {
     if (!state.player) return;
     const cost = state.player.level * 10;
@@ -1643,14 +1134,14 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
     setState(prev => ({
       ...prev,
-      player: {
-        ...prev.player!,
-        hp: Math.floor(prev.player!.maxHp),
-        mp: Math.floor(prev.player!.maxMp),
-        gold: prev.player!.gold - cost,
-      },
+      player: prev.player ? {
+        ...prev.player,
+        hp: Math.floor(prev.player.maxHp),
+        mp: Math.floor(prev.player.maxMp),
+        gold: prev.player.gold - cost,
+      } : null,
     }));
-    addLog(`在旅館休息了一晚，體力與魔力完全恢復了。（花費 ${cost} 金幣）`);
+    addLog(`🛏️ 在旅館開了間舒適套房休息，體力與魔力完全恢復了！（花費 ${cost} 金幣）`);
   };
 
   const buyItem = (itemId: string) => {
@@ -1771,6 +1262,27 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
         // Time in map
         let newTimeInMap = prev.timeInMap + TICK;
 
+        // Revamped Natural HP & MP Recovery Rates (10s Passive Tick Rate - Lineage Formula)
+        const isRestingAtInn = newPlayer.activeTab === 'inn';
+        
+        const multiplier = isRestingAtInn ? 2 : 1;
+        
+        // Accumulate time or tick-based every 10 seconds (100 ticks since tick is 0.1s)
+        const isRecoveryTick = Math.round(newTimeInMap * 10) % 100 === 0;
+
+         if (isRecoveryTick) {
+          const { hpRegen, mpRegen } = calculateLineageRegen(newPlayer);
+          const finalHpRegen = hpRegen * multiplier;
+          const finalMpRegen = mpRegen * multiplier;
+          
+          if (newPlayer.hp > 0 || isRestingAtInn) {
+            const nextHp = (newPlayer.hp || 0) + (finalHpRegen || 0);
+            const nextMp = (newPlayer.mp || 0) + (finalMpRegen || 0);
+            newPlayer.hp = Math.min(newPlayer.maxHp || 100, isNaN(nextHp) ? 100 : parseFloat(nextHp.toFixed(2)));
+            newPlayer.mp = Math.min(newPlayer.maxMp || 30, isNaN(nextMp) ? 30 : parseFloat(nextMp.toFixed(2)));
+          }
+        }
+
         // Respawn and Movement
         let newSubMapEnemies = prev.subMapEnemies.map(e => {
           let newE = { ...e };
@@ -1783,11 +1295,13 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
           } else if (!prev.inCombat || (prev.currentEnemy && prev.currentEnemy.instanceId !== e.instanceId)) {
             // Random movement if not in combat with this specific enemy
             if (Math.random() < 0.02) { // Adjusted for 100ms tick
-              newE.distance = Math.max(1, Math.min(20, newE.distance + (Math.random() > 0.5 ? 1 : -1)));
+              newE.distance = parseFloat(Math.max(1, Math.min(20, newE.distance + (Math.random() > 0.5 ? 1 : -1))).toFixed(1));
             }
             // Active enemies move towards player if close (within 10m)
             if (newE.behavior === 'active' && newE.distance > 1 && newE.distance <= 10) {
-              if (Math.random() < 0.1) newE.distance -= 1; // Adjusted for 100ms tick
+              if (Math.random() < 0.1) {
+                newE.distance = parseFloat(Math.max(1, newE.distance - 0.2).toFixed(1)); // Approach by 0.2m instead of 1m
+              }
             }
           }
           return newE;
@@ -1951,6 +1465,7 @@ export const GameProvider: React.FC<{ children: React.ReactNode }> = ({ children
       setQuickItem,
       useQuickItem,
       toggleAutoAttack, 
+      toggleAutoPlay,
       restAtInn, 
       buyItem, 
       sellItem, 

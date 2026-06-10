@@ -47,7 +47,7 @@ export const processAdventureCombat = (
     if (aggroEnemy) {
       newInCombat = true;
       newEnemy = aggroEnemy;
-      newLogs.unshift(`${aggroEnemy.name} 發現了你並發動主動攻擊！ (距離: ${aggroEnemy.distance}m)`);
+      newLogs.unshift(`${aggroEnemy.name} 發現了你並發動主動攻擊！ (距離: ${aggroEnemy.distance.toFixed(1)}m)`);
     }
   }
 
@@ -58,21 +58,45 @@ export const processAdventureCombat = (
       const instance = newPlayer.inventory.find(i => i.instanceId === weaponInstanceId);
       if (instance) {
         const item = ITEM_DATA.find(i => i.id === instance.id);
-        if (item && item.range) playerRange = item.range;
+        if (item) {
+          if (item.range) playerRange = item.range;
+          if (item.name.includes('弓') || item.id.includes('bow')) {
+            playerRange = 6; // Range is 6m when holding a bow
+          }
+        }
+      } else {
+        // Fallback: search ITEM_DATA directly if weaponInstanceId is item ID or mapping mismatch
+        const item = ITEM_DATA.find(i => i.id === weaponInstanceId);
+        if (item) {
+          if (item.range) playerRange = item.range;
+          if (item.name.includes('弓') || item.id.includes('bow')) {
+            playerRange = 6;
+          }
+        }
       }
     }
 
-    if (newEnemy.distance > playerRange) {
-      newEnemy.distance = Math.max(playerRange, newEnemy.distance - 1);
-      newLogs.unshift(`正在向 ${newEnemy.name} 移動中... (距離: ${newEnemy.distance}m)`);
-    }
+    const isPlayerRanged = playerRange > 1;
 
-    if (newEnemy.distance > newEnemy.range) {
-      newEnemy.distance = Math.max(newEnemy.range, newEnemy.distance - 1);
+    // Movement: Decrease distance if outside player range or enemy range. No backstepping/retreat function.
+    const targetDistance = Math.min(playerRange, newEnemy.range);
+    if (newEnemy.distance > targetDistance) {
+      // Decrease by 0.2m per tick instead of 1m per tick to give player time to use ranged weapons/skills
+      newEnemy.distance = parseFloat(Math.max(targetDistance, newEnemy.distance - 0.2).toFixed(1));
     }
 
     if (newEnemy.hp > 0) {
-      newPlayer.autoSkills.forEach(skillId => {
+      // Collect autoSkills, plus quickSkills if in auto play
+      const targetAutoSkills = [...newPlayer.autoSkills];
+      if (prev.isAutoPlay) {
+        newPlayer.quickSkills.forEach(sid => {
+          if (sid && !targetAutoSkills.includes(sid)) {
+            targetAutoSkills.push(sid);
+          }
+        });
+      }
+
+      targetAutoSkills.forEach(skillId => {
         const skill = SKILL_DATA.find(s => s.id === skillId);
         if (skill && (newCooldowns[skillId] || 0) === 0 && newPlayer.mp >= skill.mpCost) {
           const effectiveRange = skill.range || playerRange;
@@ -82,7 +106,7 @@ export const processAdventureCombat = (
             newEnemy!.hp = Math.floor(Math.max(0, newEnemy!.hp - damage));
             newPlayer.mp -= skill.mpCost;
             newCooldowns[skillId] = skill.cooldown;
-            newLogs.unshift(`[自動] 使用了 ${skill.name}，造成了 ${damage} 點傷害！ (距離: ${newEnemy!.distance}m)`);
+            newLogs.unshift(`[自動] 使用了 ${skill.name}，造成了 ${damage} 點傷害！ (距離: ${newEnemy!.distance.toFixed(1)}m)`);
           } else if (skill.type === 'buff') {
             newPlayer.mp -= skill.mpCost;
             newCooldowns[skillId] = skill.cooldown;
@@ -100,12 +124,14 @@ export const processAdventureCombat = (
       if (newAttackProgress >= 100) {
         newAttackProgress -= 100;
         let playerAtk = derived.meleeAtk;
-        if (newPlayer.class === CharacterClass.ELF) playerAtk = derived.rangedAtk;
+        if (newPlayer.class === CharacterClass.ELF) {
+          playerAtk = isPlayerRanged ? derived.rangedAtk : derived.meleeAtk;
+        }
         if (newPlayer.class === CharacterClass.MAGE) playerAtk = derived.magicAtk;
 
         const damage = calculateDamage(playerAtk, newEnemy.def);
         newEnemy.hp = Math.floor(Math.max(0, newEnemy.hp - damage));
-        newLogs.unshift(`你對 ${newEnemy.name} 造成了 ${damage} 點傷害！ (距離: ${newEnemy.distance}m)`);
+        newLogs.unshift(`你對 ${newEnemy.name} 造成了 ${damage} 點傷害！ (距離: ${newEnemy.distance.toFixed(1)}m)`);
         playSound('attack');
       }
     } else {
@@ -157,6 +183,24 @@ export const processAdventureCombat = (
         e.instanceId === newEnemy!.instanceId ? { ...e, hp: 0, respawnTimer: e.respawnTime } : e
       );
 
+      // In Auto Play, find next target automatically
+      let nextEnemy = null;
+      if (prev.isAutoPlay) {
+        const aliveEnemies = finalEnemies.filter(e => e.hp > 0 && e.respawnTimer === 0);
+        if (aliveEnemies.length > 0) {
+          aliveEnemies.sort((a, b) => {
+            if (a.behavior === 'active' && b.behavior !== 'active') return -1;
+            if (b.behavior === 'active' && a.behavior !== 'active') return 1;
+            return a.distance - b.distance;
+          });
+          nextEnemy = aliveEnemies[0];
+          newLogs.unshift(`[自動] 自動瞄準下一個目標：${nextEnemy.name} (距離: ${nextEnemy.distance}m)`);
+        }
+      }
+
+      const nextInCombat = nextEnemy ? true : false;
+      const nextIsAutoAttacking = nextEnemy ? true : false;
+
       return {
         newPlayer: {
           ...newPlayer,
@@ -171,9 +215,9 @@ export const processAdventureCombat = (
           evasion: derived.evasion,
         },
         newSubMapEnemies: finalEnemies,
-        newEnemy: null,
+        newEnemy: nextEnemy,
         newLogs: newLogs.slice(0, 50),
-        newInCombat: false,
+        newInCombat: nextInCombat,
         newAttackProgress: 0,
         newCooldowns,
         newBuffs,
@@ -192,11 +236,11 @@ export const processAdventureCombat = (
             hp: Math.floor(Math.min(derived.maxHp, newPlayer.hp)),
             evasion: derived.evasion,
           },
-          inCombat: false,
-          currentEnemy: null,
-          selectedEnemyInstanceId: null,
+          inCombat: nextInCombat,
+          currentEnemy: nextEnemy,
+          selectedEnemyInstanceId: nextEnemy ? nextEnemy.instanceId : null,
           subMapEnemies: finalEnemies,
-          isAutoAttacking: false,
+          isAutoAttacking: nextIsAutoAttacking,
           attackProgress: 0,
           combatLogs: newLogs.slice(0, 50),
         }
@@ -206,8 +250,35 @@ export const processAdventureCombat = (
 
   // Enemy Attack (Mobbing)
   if (Math.random() < TICK * 0.5) {
+    const weaponInstanceId = newPlayer.equipment.weapon;
+    let isPlayerRanged = false;
+    let activePlayerRange = 1;
+    if (weaponInstanceId) {
+      const instance = newPlayer.inventory.find(i => i.instanceId === weaponInstanceId);
+      if (instance) {
+        const item = ITEM_DATA.find(i => i.id === instance.id);
+        if (item) {
+          if (item.range) activePlayerRange = item.range;
+          if (item.name.includes('弓') || item.id.includes('bow')) {
+            activePlayerRange = 6;
+          }
+        }
+      } else {
+        const item = ITEM_DATA.find(i => i.id === weaponInstanceId);
+        if (item) {
+          if (item.range) activePlayerRange = item.range;
+          if (item.name.includes('弓') || item.id.includes('bow')) {
+            activePlayerRange = 6;
+          }
+        }
+      }
+    }
+
+    isPlayerRanged = activePlayerRange > 1;
+
     newSubMapEnemies.forEach(enemy => {
-      if (enemy.hp > 0 && enemy.respawnTimer === 0 && enemy.distance <= enemy.range) {
+      const canEnemyReach = enemy.distance <= enemy.range || (isPlayerRanged && enemy.distance <= activePlayerRange);
+      if (enemy.hp > 0 && enemy.respawnTimer === 0 && canEnemyReach) {
         if (enemy.behavior === 'active' || (newEnemy && enemy.instanceId === newEnemy.instanceId)) {
           const derived = calculateDerivedStats(newPlayer, newBuffs);
           const enemyDamage = calculateEnemyDamage(enemy.atk, derived.physDef);
@@ -217,6 +288,13 @@ export const processAdventureCombat = (
             newLogs.unshift(`${enemy.name} 對你造成了 ${enemyDamage} 點傷害！`);
           } else if (enemy.behavior === 'active') {
             newLogs.unshift(`${enemy.name} 從旁偷襲，對你造成了 ${enemyDamage} 點傷害！`);
+            
+            // In Auto Play, automatically counter-attack when attacked
+            if (prev.isAutoPlay && !newInCombat) {
+              newEnemy = enemy;
+              newInCombat = true;
+              newLogs.unshift(`[反擊] 受到 ${enemy.name} 攻擊，自動開始攻擊！`);
+            }
           }
           playSound('hit');
         }

@@ -149,8 +149,8 @@ export interface Player {
     shield?: string;
     accessory?: string;
   };
-  quickItems: (string | null)[]; // 4 slots
-  quickSkills: (string | null)[]; // 4 slots
+  quickItems: (string | null)[]; // 8 slots
+  quickSkills: (string | null)[]; // 8 slots
   attackSpeed: number;
   autoPotionHpThreshold: number;
   autoPotionMpThreshold: number;
@@ -158,6 +158,8 @@ export interface Player {
   pvpKills: number;
   pvpDeaths: number;
   lastAttackerName?: string;
+  activeTab?: 'adventure' | 'inn' | 'shop' | 'skills' | 'settings' | 'inventory' | 'world';
+  isDeepSleeping?: boolean;
 }
 
 export interface GameState {
@@ -170,6 +172,7 @@ export interface GameState {
   selectedEnemyInstanceId: string | null;
   combatLogs: string[];
   isAutoAttacking: boolean;
+  isAutoPlay: boolean; // Auto/Manual mode
   activeBuffs: { id: string; remaining: number }[];
   cooldowns: Record<string, number>;
   attackProgress: number;

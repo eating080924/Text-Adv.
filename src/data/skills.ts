@@ -87,7 +87,7 @@ export const SKILL_DATA: Skill[] = [
     category: 'class',
     requiredClass: CharacterClass.MAGE,
     mpCost: 8,
-    cooldown: 0,
+    cooldown: 2,
     range: 6,
     icon: 'Flame',
     effect: (player, target) => {

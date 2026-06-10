@@ -27,9 +27,6 @@ export const ITEM_DATA: Item[] = [
   { id: 'weapon_scroll', name: '武器強化卷軸', description: '有機率強化武器攻擊力。', type: 'item', price: 1, isScroll: true, scrollType: 'weapon' },
   { id: 'armor_scroll', name: '防具強化卷軸', description: '有機率強化防具防禦力。', type: 'item', price: 1, isScroll: true, scrollType: 'armor' },
   
-  // Items
-  { id: 'return_scroll', name: '回城卷軸', description: '瞬間回到旅館。', type: 'item', price: 50 },
-  
   // Skill Books
   { id: 'skill_book_meditation', name: '技能書：冥想', description: '學習冥想技能。', type: 'skillBook', price: 1, skillId: 'meditation' },
   { id: 'skill_book_shield_bash', name: '技能書：盾擊', description: '學習盾擊技能。', type: 'skillBook', price: 1, skillId: 'shield_bash' },

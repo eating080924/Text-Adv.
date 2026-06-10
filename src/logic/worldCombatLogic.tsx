@@ -2,7 +2,7 @@ import { Player, CharacterClass, DerivedStats, SubMapEnemy } from '../types';
 import { calculateDamage } from '../utils/combatUtils';
 import { ITEM_DATA } from '../data/items';
 import { SKILL_DATA } from '../data/skills';
-import { supabase } from '../supabase';
+import { sendAttack } from '../lib/firebase';
 
 export interface WorldCombatResult {
   newPlayer: Player;
@@ -48,39 +48,52 @@ export const processWorldCombat = (
       const instance = newPlayer.inventory.find(i => i.instanceId === weaponInstanceId);
       if (instance) {
         const item = ITEM_DATA.find(i => i.id === instance.id);
-        if (item && item.range) playerRange = item.range;
+        if (item) {
+          if (item.range) playerRange = item.range;
+          if (item.name.includes('弓') || item.id.includes('bow')) {
+            playerRange = 6; // Range is 6m when holding a bow
+          }
+        }
+      } else {
+        // Fallback: search ITEM_DATA directly if weaponInstanceId is item ID or mapping mismatch
+        const item = ITEM_DATA.find(i => i.id === weaponInstanceId);
+        if (item) {
+          if (item.range) playerRange = item.range;
+          if (item.name.includes('弓') || item.id.includes('bow')) {
+            playerRange = 6;
+          }
+        }
       }
     }
 
-    if (newEnemy.distance > playerRange) {
-      newEnemy.distance = Math.max(playerRange, newEnemy.distance - 1);
-      newLogs.unshift(`正在向 ${newEnemy.name} 移動中... (距離: ${newEnemy.distance}m)`);
-    }
+    const isPlayerRanged = playerRange > 1;
+
+    // Movement: Canceled for World Map
+    const targetDistance = Math.min(playerRange, newEnemy.range);
 
     if (newEnemy.hp > 0) {
-      newPlayer.autoSkills.forEach(skillId => {
+      // Collect autoSkills, plus quickSkills if in auto play
+      const targetAutoSkills = [...newPlayer.autoSkills];
+      if (prev.isAutoPlay) {
+        newPlayer.quickSkills.forEach(sid => {
+          if (sid && !targetAutoSkills.includes(sid)) {
+            targetAutoSkills.push(sid);
+          }
+        });
+      }
+
+      targetAutoSkills.forEach(skillId => {
         const skill = SKILL_DATA.find(s => s.id === skillId);
         if (skill && (newCooldowns[skillId] || 0) === 0 && newPlayer.mp >= skill.mpCost) {
-          const effectiveRange = skill.range || playerRange;
-          if (skill.type === 'active' && newEnemy!.distance <= effectiveRange) {
+          if (skill.type === 'active') {
             const result = skill.effect(newPlayer, newEnemy);
             const damage = calculateDamage(result.damage + newEnemy!.def, newEnemy!.def);
             newEnemy!.hp = Math.floor(Math.max(0, newEnemy!.hp - damage));
             newPlayer.mp -= skill.mpCost;
             newCooldowns[skillId] = skill.cooldown;
-            newLogs.unshift(`[自動] 使用了 ${skill.name}，造成了 ${damage} 點傷害！ (距離: ${newEnemy!.distance}m)`);
-
-            if (newEnemy.instanceId === 'world_boss') {
-              supabase.from('world_boss').update({ hp: Math.max(0, newEnemy.hp) }).eq('id', 'boss');
-            }
-
-            if (newEnemy.instanceId.startsWith('player-') && newEnemy.targetUid) {
-              supabase.from('users').update({
-                hp: Math.max(0, newEnemy.hp),
-                lastAttackerName: newPlayer.id,
-                lastUpdate: new Date().toISOString()
-              }).eq('id', newEnemy.targetUid);
-            }
+            newLogs.unshift(`[自動] 使用了 ${skill.name}，造成了 ${damage} 點傷害！`);
+            // Real-time remote PvP sync
+            sendAttack(newEnemy!.id, newPlayer.uid || 'unknown', newPlayer.id || '冒險者', damage);
           } else if (skill.type === 'buff') {
             newPlayer.mp -= skill.mpCost;
             newCooldowns[skillId] = skill.cooldown;
@@ -91,83 +104,64 @@ export const processWorldCombat = (
       });
     }
 
-    if (isAutoAttacking && newEnemy.hp > 0 && newEnemy.distance <= playerRange) {
+    if (isAutoAttacking && newEnemy.hp > 0) {
       const derived = calculateDerivedStats(newPlayer, newBuffs);
       newAttackProgress += derived.attackSpeed * TICK * 100;
 
       if (newAttackProgress >= 100) {
         newAttackProgress -= 100;
         let playerAtk = derived.meleeAtk;
-        if (newPlayer.class === CharacterClass.ELF) playerAtk = derived.rangedAtk;
+        if (newPlayer.class === CharacterClass.ELF) {
+          playerAtk = isPlayerRanged ? derived.rangedAtk : derived.meleeAtk;
+        }
         if (newPlayer.class === CharacterClass.MAGE) playerAtk = derived.magicAtk;
 
         const damage = calculateDamage(playerAtk, newEnemy.def);
         newEnemy.hp = Math.floor(Math.max(0, newEnemy.hp - damage));
-        newLogs.unshift(`你對 ${newEnemy.name} 造成了 ${damage} 點傷害！ (距離: ${newEnemy.distance}m)`);
+        newLogs.unshift(`你對 ${newEnemy.name} 造成了 ${damage} 點傷害！`);
         playSound('attack');
-
-        if (newEnemy.instanceId === 'world_boss') {
-          supabase.from('world_boss').update({ hp: Math.max(0, newEnemy.hp) }).eq('id', 'boss');
-        }
-
-        if (newEnemy.instanceId.startsWith('player-') && newEnemy.targetUid) {
-          // 🛡️ PvP Kill Protection:
-          // Don't let the attacker's local calculation trigger the final blow.
-          // We cap the local HP at 1 and wait for the victim to broadcast their own death.
-          // This prevents "killing" someone who just healed on their screen.
-          if (newEnemy.hp <= 0) {
-            newEnemy.hp = 1;
-          }
-
-          supabase.from('users').update({
-            hp: Math.max(1, newEnemy.hp),
-            lastAttackerName: newPlayer.id
-          }).eq('id', newEnemy.targetUid);
-
-          // ✅ Send broadcast for immediate feedback
-          const worldChannel = (window as any).worldChannel;
-          if (worldChannel) {
-            worldChannel.send({
-              type: 'broadcast',
-              event: 'pvp_damage',
-              payload: {
-                attackerId: newPlayer.uid,
-                attackerName: newPlayer.id,
-                victimId: newEnemy.targetUid,
-                damage: damage,
-                newHp: newEnemy.hp
-              }
-            });
-          }
-        }
+        // Real-time remote PvP sync
+        sendAttack(newEnemy.id, newPlayer.uid || 'unknown', newPlayer.id || '冒險者', damage);
       }
     } else {
       newAttackProgress = 0;
     }
 
-    // Only trigger kill logic for non-players or if HP is truly 0 (from sync)
+    // Only trigger kill logic if HP is truly 0 (from sync)
     if (newEnemy.hp <= 0) {
-      if (newEnemy.instanceId === 'world_boss') {
-        supabase.from('world_boss').update({
-          status: 'cooldown',
-          lastKillFaction: newPlayer.faction,
-          nextSpawnTime: new Date(Date.now() + 4 * 60 * 60 * 1000).toISOString(),
-          hp: 1000000
-        }).eq('id', 'boss');
-        newLogs.unshift(`恭喜！你的陣營 ${newPlayer.faction} 成功擊敗了世界級 BOSS！`);
-      }
-
-      // Note: Player kill logic is now handled via pvp_death broadcast and GameContext listeners
-      // to ensure the victim's own HP state is the source of truth.
-      
       const derived = calculateDerivedStats(newPlayer, newBuffs);
       const finalWorldEnemies = newWorldEnemies.map(e => 
         e.instanceId === newEnemy!.instanceId ? { ...e, hp: 0, respawnTimer: e.respawnTime } : e
       );
 
+      let updatedPlayerKills = newPlayer.pvpKills || 0;
+      if (newEnemy.isPlayer) {
+        updatedPlayerKills += 1;
+        newLogs.unshift(`[PVP] 擊殺成功！你成功擊敗了玩家 ${newEnemy.name}！`);
+      }
+
+      // In Auto Play, find next target automatically
+      let nextEnemy = null;
+      if (prev.isAutoPlay) {
+        const aliveEnemies = finalWorldEnemies.filter(e => e.hp > 0 && e.respawnTimer === 0);
+        if (aliveEnemies.length > 0) {
+          aliveEnemies.sort((a, b) => {
+            if (a.behavior === 'active' && b.behavior !== 'active') return -1;
+            if (b.behavior === 'active' && a.behavior !== 'active') return 1;
+            return 0;
+          });
+          nextEnemy = aliveEnemies[0];
+          newLogs.unshift(`[自動] 自動瞄準下一個目標：${nextEnemy.name}`);
+        }
+      }
+
+      const nextInCombat = nextEnemy ? true : false;
+      const nextIsAutoAttacking = nextEnemy ? true : false;
+
       return {
         newPlayer: {
           ...newPlayer,
+          pvpKills: updatedPlayerKills,
           meleeAtk: derived.meleeAtk,
           rangedAtk: derived.rangedAtk,
           magicAtk: derived.magicAtk,
@@ -179,9 +173,9 @@ export const processWorldCombat = (
           evasion: derived.evasion,
         },
         newWorldEnemies: finalWorldEnemies,
-        newEnemy: null,
+        newEnemy: nextEnemy,
         newLogs: newLogs.slice(0, 50),
-        newInCombat: false,
+        newInCombat: nextInCombat,
         newAttackProgress: 0,
         newCooldowns,
         newBuffs,
@@ -190,6 +184,7 @@ export const processWorldCombat = (
           ...prev,
           player: {
             ...newPlayer,
+            pvpKills: updatedPlayerKills,
             meleeAtk: derived.meleeAtk,
             rangedAtk: derived.rangedAtk,
             magicAtk: derived.magicAtk,
@@ -200,57 +195,39 @@ export const processWorldCombat = (
             hp: Math.floor(Math.min(derived.maxHp, newPlayer.hp)),
             evasion: derived.evasion,
           },
-          inCombat: false,
-          currentEnemy: null,
-          selectedEnemyInstanceId: null,
+          inCombat: nextInCombat,
+          currentEnemy: nextEnemy,
+          selectedEnemyInstanceId: nextEnemy ? nextEnemy.instanceId : null,
           worldEnemies: finalWorldEnemies,
-          isAutoAttacking: false,
+          isAutoAttacking: nextIsAutoAttacking,
           attackProgress: 0,
           combatLogs: newLogs.slice(0, 50),
         }
       };
     }
 
-    // Enemy Attack Logic (Counter-attack)
-    // For World Boss: Always counter-attack since it's a shared entity
-    // For Players: We rely on the other player's client to auto-retaliate via user-sync
-    if (newEnemy.hp > 0 && newEnemy.distance <= newEnemy.range && newEnemy.instanceId === 'world_boss') {
-      if (Math.random() < TICK * 0.5) { // Boss attacks once per 2 seconds on average
+    // Enemy Attack Logic (Counter-attack - No distance limit on World Map, only for non-player targets like World Bosses)
+    const canEnemyReach = true;
+    if (newEnemy.hp > 0 && canEnemyReach && !newEnemy.isPlayer) {
+      if (Math.random() < TICK * 0.5) { // NPC/Bot attacks once per 2 seconds on average
         const enemyDamage = Math.max(1, Math.floor(newEnemy.atk - newPlayer.physDef));
         newPlayer.hp = Math.max(0, Math.floor(newPlayer.hp - enemyDamage));
         newPlayer.lastAttackerName = newEnemy.name; 
         newLogs.unshift(`${newEnemy.name} 對你造成了 ${enemyDamage} 點傷害！`);
         playSound('hit');
-
-        // Sync player HP to Supabase immediately if attacked by boss
-        supabase.from('users').update({
-          hp: newPlayer.hp,
-          lastAttackerName: newEnemy.name,
-          lastUpdate: new Date().toISOString()
-        }).eq('id', player.uid);
       }
     }
   }
 
   if (newPlayer.hp <= 0) {
+    const updatedPlayerDeaths = (newPlayer.pvpDeaths || 0) + 1;
     newLogs.unshift('你被打敗了... 回到了旅館。');
-    
-    // Broadcast death for immediate feedback to the attacker
-    const worldChannel = (window as any).worldChannel;
-    if (worldChannel) {
-      worldChannel.send({
-        type: 'broadcast',
-        event: 'pvp_death',
-        payload: {
-          playerId: newPlayer.uid,
-          playerName: newPlayer.id,
-          attackerName: newPlayer.lastAttackerName
-        }
-      });
-    }
 
     return {
-      newPlayer,
+      newPlayer: {
+        ...newPlayer,
+        pvpDeaths: updatedPlayerDeaths,
+      },
       newWorldEnemies,
       newEnemy,
       newLogs,
@@ -261,7 +238,12 @@ export const processWorldCombat = (
       shouldReturn: true,
       returnState: {
         ...prev,
-        player: { ...newPlayer, hp: Math.floor(newPlayer.maxHp * 0.5), isInWorld: false },
+        player: { 
+          ...newPlayer, 
+          pvpDeaths: updatedPlayerDeaths,
+          hp: Math.floor(newPlayer.maxHp * 0.5), 
+          isInWorld: false 
+        },
         currentMap: null,
         currentSubMap: null,
         subMapEnemies: [],

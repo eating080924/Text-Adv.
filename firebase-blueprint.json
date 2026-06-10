@@ -1,0 +1,47 @@
+{
+  "entities": {
+    "world_player": {
+      "title": "World Player",
+      "description": "Active real-time player on the world map",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "User UID" },
+        "name": { "type": "string", "description": "Character name" },
+        "class": { "type": "string", "description": "Character class" },
+        "faction": { "type": "string", "description": "Faction alignment" },
+        "level": { "type": "integer", "description": "Character level" },
+        "hp": { "type": "integer", "description": "Current HP" },
+        "maxHp": { "type": "integer", "description": "Max HP" },
+        "mp": { "type": "integer", "description": "Current MP" },
+        "maxMp": { "type": "integer", "description": "Max MP" },
+        "atk": { "type": "number", "description": "Attack rating" },
+        "def": { "type": "number", "description": "Defense rating" },
+        "isInWorld": { "type": "boolean", "description": "Is active on world map" },
+        "lastActive": { "type": "integer", "description": "Epoch timestamp of last update" }
+      },
+      "required": ["id", "name", "class", "faction", "level", "hp", "maxHp", "isInWorld", "lastActive"]
+    },
+    "world_attack": {
+      "title": "World Attack Event",
+      "description": "Real-time attack event sent to a target player",
+      "type": "object",
+      "properties": {
+        "attackerUid": { "type": "string", "description": "UID of the attacker" },
+        "attackerName": { "type": "string", "description": "Name of the attacker" },
+        "damage": { "type": "integer", "description": "Calculated damage dealt" },
+        "timestamp": { "type": "integer", "description": "Epoch timestamp of the attack" }
+      },
+      "required": ["attackerUid", "attackerName", "damage", "timestamp"]
+    }
+  },
+  "firestore": {
+    "/world_players/{playerId}": {
+      "schema": "world_player",
+      "description": "Collection of all active players"
+    },
+    "/world_players/{playerId}/attacks/{attackId}": {
+      "schema": "world_attack",
+      "description": "Real-time attacks subcollection for receiving incoming damage events"
+    }
+  }
+}

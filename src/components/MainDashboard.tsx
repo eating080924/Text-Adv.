@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { useGame } from '../context/GameContext';
 import { motion, AnimatePresence } from 'motion/react';
-import { Map, Home, ShoppingBag, Settings, Sword, ScrollText, Heart, Zap, Coins, Shield, X, Package, Sparkles } from 'lucide-react';
+import { Map, Home, ShoppingBag, Settings, Sword, ScrollText, Heart, Zap, Coins, Shield, X, Package, Sparkles, Brain, Wind, Flame } from 'lucide-react';
 import { AdventureMap } from './AdventureMap';
 import { Shop } from './Shop';
 import { Inn } from './Inn';
@@ -10,12 +10,71 @@ import { Skills } from './Skills';
 import { Inventory } from './Inventory';
 import { World } from './World';
 import { ITEM_DATA } from '../data/items';
+import { SKILL_DATA } from '../data/skills';
 import { ItemInstance, Player } from '../types';
 
 export const MainDashboard: React.FC = () => {
   const { player, inCombat, combatLogs, currentSubMap, selectMap, activeBuffs, deleteCharacter, updateSettings } = useGame();
+  
+  const getBuffDisplay = (buffId: string) => {
+    switch (buffId) {
+      case 'meditation':
+        return {
+          name: '冥想',
+          shortName: '冥想',
+          bg: 'from-blue-950/80 to-indigo-950/80',
+          border: 'border-blue-500/30',
+          textColor: 'text-blue-400',
+          icon: <Brain className="w-3 h-3 text-blue-400" />
+        };
+      case 'warcry':
+        return {
+          name: '戰吼',
+          shortName: '戰吼',
+          bg: 'from-rose-955/80 to-red-950/80',
+          border: 'border-rose-500/30',
+          textColor: 'text-rose-400',
+          icon: <Flame className="w-3 h-3 text-rose-400" />
+        };
+      case 'wind_walk':
+        return {
+          name: '風之步',
+          shortName: '風步',
+          bg: 'from-teal-955/80 to-emerald-950/80',
+          border: 'border-teal-500/30',
+          textColor: 'text-teal-400',
+          icon: <Wind className="w-3 h-3 text-teal-400" />
+        };
+      case 'mana_shield':
+        return {
+          name: '魔力護盾',
+          shortName: '護盾',
+          bg: 'from-indigo-955/80 to-violet-950/80',
+          border: 'border-indigo-500/30',
+          textColor: 'text-indigo-400',
+          icon: <Shield className="w-3 h-3 text-indigo-400" />
+        };
+      case 'haste_potion':
+        return {
+          name: '速度藥水',
+          shortName: '急速',
+          bg: 'from-amber-955/80 to-yellow-950/80',
+          border: 'border-amber-500/30',
+          textColor: 'text-amber-400',
+          icon: <Zap className="w-3 h-3 text-amber-400" />
+        };
+      default:
+        return {
+          name: buffId,
+          shortName: buffId.substring(0, 2).toUpperCase(),
+          bg: 'from-slate-950/80 to-slate-900/80',
+          border: 'border-slate-800/50',
+          textColor: 'text-slate-400',
+          icon: <Sparkles className="w-3 h-3 text-slate-400" />
+        };
+    }
+  };
   const [activeTab, setActiveTab] = useState<'adventure' | 'inn' | 'shop' | 'skills' | 'settings' | 'inventory' | 'world'>('adventure');
-  const [showConfirm, setShowConfirm] = useState<{ target: any } | null>(null);
   const [showStats, setShowStats] = useState(false);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
@@ -28,83 +87,145 @@ export const MainDashboard: React.FC = () => {
 
   if (!player) return null;
 
-  const handleTabChange = (tab: any) => {
-    const isMapActive = currentSubMap || activeTab === 'world';
-    if (isMapActive && tab !== activeTab && (tab === 'inn' || tab === 'shop' || tab === 'adventure' || tab === 'world')) {
-      setShowConfirm({ target: tab });
-    } else {
-      setActiveTab(tab);
-      // Update isInWorld status
-      if (player) {
-        updateSettings({ isInWorld: tab === 'world' });
-      }
-    }
-  };
+  const hpMax = player.maxHp || 1;
+  const hpVal = isNaN(player.hp) ? 0 : player.hp;
+  const hpPct = Math.min(100, Math.max(0, (hpVal / hpMax) * 100));
 
-  const confirmLeave = () => {
-    if (showConfirm) {
-      const targetTab = showConfirm.target;
-      setActiveTab(targetTab);
-      setShowConfirm(null);
-      selectMap('', ''); 
-      // Update isInWorld status
-      if (player) {
-        updateSettings({ isInWorld: targetTab === 'world' });
-      }
+  const mpMax = player.maxMp || 1;
+  const mpVal = isNaN(player.mp) ? 0 : player.mp;
+  const mpPct = Math.min(100, Math.max(0, (mpVal / mpMax) * 100));
+
+  const expMax = player.nextLevelExp || 1;
+  const expVal = isNaN(player.exp) ? 0 : player.exp;
+  const expPct = Math.min(100, Math.max(0, (expVal / expMax) * 100));
+
+  React.useEffect(() => {
+    updateSettings({ activeTab });
+  }, [activeTab]);
+
+  const handleTabChange = (tab: any) => {
+    if (tab === activeTab) return;
+
+    // Reset submap automatically if they leave the adventure page during an active run
+    if (currentSubMap && tab !== 'adventure') {
+      selectMap('', '');
+    }
+
+    setActiveTab(tab);
+    
+    // Update isInWorld status
+    if (player) {
+      updateSettings({ isInWorld: tab === 'world' });
     }
   };
 
   return (
     <div className="h-screen bg-slate-950 text-white flex flex-col max-w-4xl mx-auto border-x border-slate-800">
       {/* Header / Player Stats */}
-      <div className="bg-slate-900 p-4 border-b border-slate-800 sticky top-0 z-10">
-        <div className="flex justify-between items-center mb-4">
-          <div className="flex items-center gap-3 cursor-pointer hover:opacity-80 transition-opacity" onClick={() => setShowStats(true)}>
-            <div className="w-12 h-12 bg-blue-600 rounded-full flex items-center justify-center font-bold text-xl border-2 border-blue-400">
+      <div className="bg-slate-900 p-3 px-4 border-b border-slate-800 sticky top-0 z-10">
+        <div className="flex justify-between items-center gap-4">
+          {/* Left: Player Info + HP/MP/EXP Consolidated in the top-left area */}
+          <div className="flex items-center gap-3">
+            <div 
+              className="w-10 h-10 bg-blue-600 rounded-full flex shrink-0 items-center justify-center font-bold text-lg border-2 border-blue-400 cursor-pointer hover:opacity-80 transition-opacity"
+              onClick={() => setShowStats(true)}
+            >
               {player.id[0].toUpperCase()}
             </div>
-            <div>
-              <h2 className="font-bold text-lg">
-                {player.id} <span className={`text-xs font-normal opacity-70`}>({player.faction})</span>
-              </h2>
-              <p className="text-xs text-slate-400">Lv.{player.level} {player.class}</p>
-            </div>
-          </div>
-          <div className="text-right">
-            <div className="flex items-center gap-1 text-yellow-400 font-bold">
-              <Coins className="w-4 h-4" />
-              {player.gold}
-            </div>
-            <p className="text-[10px] text-slate-500">EXP: {player.exp}/{player.nextLevelExp}</p>
-          </div>
-        </div>
+            
+            <div className="flex flex-col gap-1.5">
+              <div 
+                className="flex items-center gap-2 cursor-pointer hover:opacity-80 transition-opacity"
+                onClick={() => setShowStats(true)}
+              >
+                <span className="font-extrabold text-sm text-slate-200">{player.id}</span>
+                <span className="text-[10px] text-slate-400">Lv.{player.level}</span>
+                <span className="text-[9px] text-slate-500 font-normal">({player.faction})</span>
+              </div>
+              
+              {/* HP, MP, EXP Bars Stacked and Buff indicators on the right */}
+              <div className="flex items-center gap-4 mt-0.5 flex-wrap">
+                {/* HP, MP, EXP Bars Stacked Compactly on the Left */}
+                <div className="flex flex-col gap-1.5 w-52 sm:w-64">
+                  {/* HP */}
+                  <div className="flex items-center gap-1.5 text-xs">
+                    <span className="text-red-400 font-extrabold shrink-0 w-6 font-mono text-[10px] tracking-wider text-right">HP</span>
+                    <div className="flex-1 h-3 bg-slate-950 rounded-full overflow-hidden border border-slate-700/50">
+                      <motion.div 
+                        className="h-full bg-gradient-to-r from-red-600 to-red-400"
+                        initial={{ width: 0 }}
+                        animate={{ width: `${hpPct}%` }}
+                      />
+                    </div>
+                    <span className="text-slate-350 font-mono text-[10px] shrink-0 font-bold select-none w-14 text-right">{Math.floor(hpVal)}/{hpMax}</span>
+                  </div>
+                  {/* MP */}
+                  <div className="flex items-center gap-1.5 text-xs">
+                    <span className="text-blue-400 font-extrabold shrink-0 w-6 font-mono text-[10px] tracking-wider text-right">MP</span>
+                    <div className="flex-1 h-3 bg-slate-950 rounded-full overflow-hidden border border-slate-700/50">
+                      <motion.div 
+                        className="h-full bg-gradient-to-r from-blue-600 to-blue-400"
+                        initial={{ width: 0 }}
+                        animate={{ width: `${mpPct}%` }}
+                      />
+                    </div>
+                    <span className="text-slate-350 font-mono text-[10px] shrink-0 font-bold select-none w-14 text-right">{Math.floor(mpVal)}/{mpMax}</span>
+                  </div>
+                  {/* EXP */}
+                  <div className="flex items-center gap-1.5 text-xs">
+                    <span className="text-emerald-400 font-extrabold shrink-0 w-6 font-mono text-[9px] tracking-wider text-right">EXP</span>
+                    <div className="flex-1 h-2 bg-slate-950 rounded-full overflow-hidden border border-slate-755">
+                      <motion.div 
+                        className="h-full bg-gradient-to-r from-emerald-600 to-emerald-400"
+                        initial={{ width: 0 }}
+                        animate={{ width: `${expPct}%` }}
+                      />
+                    </div>
+                    <span className="text-slate-400 font-mono text-[9px] shrink-0 font-bold select-none w-14 text-right">{expPct.toFixed(1)}%</span>
+                  </div>
+                </div>
 
-        <div className="grid grid-cols-2 gap-4">
-          <div className="space-y-1">
-            <div className="flex justify-between text-[10px] font-bold text-red-400">
-              <span>HP</span>
-              <span>{player.hp} / {player.maxHp}</span>
-            </div>
-            <div className="relative h-2 bg-slate-800 rounded-full overflow-hidden border border-slate-700">
-              <motion.div 
-                className="absolute inset-y-0 left-0 bg-gradient-to-r from-red-600 to-red-400"
-                initial={{ width: 0 }}
-                animate={{ width: `${(player.hp / player.maxHp) * 100}%` }}
-              />
+                {/* BUFF & Potion Indicators on the Right */}
+                <div className="flex flex-wrap gap-1 items-center min-h-[3rem]">
+                  <AnimatePresence>
+                    {activeBuffs && activeBuffs.length > 0 ? (
+                      activeBuffs.map((buff) => {
+                        const info = getBuffDisplay(buff.id);
+                        return (
+                          <motion.div
+                            key={buff.id}
+                            initial={{ scale: 0.8, opacity: 0 }}
+                            animate={{ scale: 1, opacity: 1 }}
+                            exit={{ scale: 0.8, opacity: 0 }}
+                            className={`flex items-center gap-1.5 bg-gradient-to-br ${info.bg} border ${info.border} rounded-lg px-2 py-1 shadow-md shadow-slate-950/40 text-slate-200 select-none`}
+                            title={`${info.name} (剩餘 ${Math.ceil(buff.remaining)} 秒)`}
+                          >
+                            <span className="scale-105 shrink-0">{info.icon}</span>
+                            <div className="flex flex-col leading-none">
+                              <span className={`text-[9px] font-extrabold tracking-wide ${info.textColor}`}>{info.shortName}</span>
+                              <span className={`text-[8px] font-mono font-black mt-0.5 ${buff.remaining <= 3 ? 'text-red-400 animate-pulse' : 'text-slate-400'}`}>
+                                {Math.ceil(buff.remaining)}s
+                              </span>
+                            </div>
+                          </motion.div>
+                        );
+                      })
+                    ) : (
+                      <span className="text-[8px] text-slate-600 italic select-none">無增益狀態</span>
+                    )}
+                  </AnimatePresence>
+                </div>
+              </div>
             </div>
           </div>
-          <div className="space-y-1">
-            <div className="flex justify-between text-[10px] font-bold text-blue-400">
-              <span>MP</span>
-              <span>{player.mp} / {player.maxMp}</span>
+
+          {/* Right: Gold & Other quick stats info */}
+          <div className="text-right flex flex-col items-end justify-center shrink-0">
+            <div className="flex items-center gap-1 text-yellow-400 font-extrabold text-sm">
+              <Coins className="w-4 h-4" />
+              {player.gold} <span className="text-[10px] text-slate-500 font-normal">G</span>
             </div>
-            <div className="relative h-2 bg-slate-800 rounded-full overflow-hidden border border-slate-700">
-              <motion.div 
-                className="absolute inset-y-0 left-0 bg-gradient-to-r from-blue-600 to-blue-400"
-                initial={{ width: 0 }}
-                animate={{ width: `${(player.mp / player.maxMp) * 100}%` }}
-              />
-            </div>
+            <p className="text-[9px] text-slate-500 font-mono mt-0.5">{player.class}</p>
           </div>
         </div>
       </div>
@@ -115,20 +236,88 @@ export const MainDashboard: React.FC = () => {
           <div className="flex w-full">
             {/* Left: Combat Logs */}
             <div className="w-1/3 border-r border-slate-800 flex flex-col bg-slate-900/30">
-              <div className="p-2 border-b border-slate-800 bg-slate-900 text-[10px] font-bold text-slate-500 uppercase tracking-wider">
-                戰鬥訊息
+              <div className="p-2 border-b border-slate-800 bg-slate-900 text-[10px] font-bold text-slate-500 uppercase tracking-wider flex justify-between items-center">
+                <span>戰鬥訊息</span>
+                <span className="text-[8px] text-slate-600 font-mono font-normal">REALTIME MUD LOG</span>
               </div>
-              <div className="flex-1 overflow-y-auto p-2 space-y-1 font-mono text-[10px]">
-                {combatLogs.map((log, i) => (
-                  <div key={i} className={i === 0 ? 'text-white font-bold' : 'text-slate-500'}>
-                    {log}
-                  </div>
-                ))}
+              <div className="flex-1 overflow-y-auto p-3 space-y-1 font-mono text-[10px] scrollbar-thin bg-slate-950/80">
+                {combatLogs.map((log, i) => {
+                  const isLatest = i === 0;
+                  let prefix = "[系統]";
+                  let prefixColor = "text-slate-500";
+                  let textColor = "text-slate-400";
+
+                  if (log.includes("[自動]")) {
+                    prefix = "[自動]";
+                    prefixColor = "text-amber-500";
+                    textColor = "text-slate-300";
+                  } else if (log.includes("[反擊]")) {
+                    prefix = "[反擊]";
+                    prefixColor = "text-orange-500";
+                    textColor = "text-orange-200";
+                  } else if (log.includes("使用了")) {
+                    prefix = "[技能]";
+                    prefixColor = "text-indigo-400";
+                    textColor = "text-violet-300";
+                  } else if (log.includes("對你造成了") || log.includes("從旁偷襲")) {
+                    prefix = "[受傷]";
+                    prefixColor = "text-red-500";
+                    textColor = "text-red-300";
+                  } else if (log.includes("造成了") && log.includes("傷害")) {
+                    prefix = "[戰鬥]";
+                    prefixColor = "text-emerald-405";
+                    textColor = "text-emerald-300";
+                  } else if (log.includes("★ 強化成功 ★") || log.includes("強化成功")) {
+                    prefix = "[強成]";
+                    prefixColor = "text-yellow-400 font-extrabold animate-pulse";
+                    textColor = "text-yellow-300 font-bold";
+                  } else if (log.includes("強化失敗")) {
+                    prefix = "[強敗]";
+                    prefixColor = "text-red-500 font-bold";
+                    textColor = "text-rose-300";
+                  } else if (log.includes("獲得了") || log.includes("掉落了") || log.includes("金幣") || log.includes("賣出了")) {
+                    prefix = "[獲得]";
+                    prefixColor = "text-yellow-500";
+                    textColor = "text-yellow-400";
+                  } else if (log.includes("恭喜升級")) {
+                    prefix = "[升級]";
+                    prefixColor = "text-teal-400 font-extrabold animate-bounce";
+                    textColor = "text-teal-300 font-black";
+                  } else if (log.includes("被打敗了") || log.includes("死亡")) {
+                    prefix = "[戰敗]";
+                    prefixColor = "text-rose-600 font-bold";
+                    textColor = "text-rose-400 font-bold";
+                  } else if (log.includes("自然恢復")) {
+                    prefix = "[恢復]";
+                    prefixColor = "text-teal-500";
+                    textColor = "text-teal-300";
+                  }
+
+                  const cleanLog = log.replace("[自動]", "").replace("[反擊]", "").trim();
+
+                  return (
+                    <div 
+                      key={i} 
+                      className={`flex items-start gap-1 py-0.5 px-1 rounded transition-all leading-relaxed ${
+                        isLatest 
+                          ? `${cleanLog.includes("對你造成了") ? 'bg-red-950/15' : 'bg-slate-900/40'} border-l-2 border-sky-400 pl-1.5 text-[11px] font-bold` 
+                          : 'opacity-70'
+                      }`}
+                    >
+                      <span className={`font-bold shrink-0 text-[10px] ${prefixColor}`}>
+                        {prefix}
+                      </span>
+                      <span className={`flex-1 break-all ${isLatest ? 'text-slate-100' : textColor}`}>
+                        {cleanLog}
+                      </span>
+                    </div>
+                  );
+                })}
               </div>
             </div>
 
             {/* Right: Map/Combat UI */}
-            <div className="flex-1 overflow-y-auto relative">
+            <div className="flex-1 flex flex-col relative overflow-hidden">
               {activeTab === 'adventure' ? <AdventureMap /> : <World />}
             </div>
           </div>
@@ -309,30 +498,6 @@ export const MainDashboard: React.FC = () => {
           </motion.div>
         )}
       </AnimatePresence>
-
-      {/* Confirmation Dialog */}
-      {showConfirm && (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4">
-          <div className="bg-slate-900 border border-slate-800 p-6 rounded-2xl max-w-xs w-full text-center space-y-6">
-            <h3 className="text-lg font-bold">是否要離開地圖?</h3>
-            <p className="text-sm text-slate-400">離開地圖將會重置當前區域的敵人狀態。</p>
-            <div className="flex gap-3">
-              <button 
-                onClick={() => setShowConfirm(null)}
-                className="flex-1 py-2 bg-slate-800 rounded-lg font-bold hover:bg-slate-700"
-              >
-                取消
-              </button>
-              <button 
-                onClick={confirmLeave}
-                className="flex-1 py-2 bg-blue-600 rounded-lg font-bold hover:bg-blue-500"
-              >
-                確認離開
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   );
 };

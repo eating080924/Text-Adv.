@@ -3,8 +3,8 @@ import { useGame } from '../context/GameContext';
 import { MAP_DATA } from '../data/maps';
 import { SKILL_DATA } from '../data/skills';
 import { ITEM_DATA } from '../data/items';
-import { motion } from 'motion/react';
-import { Skull, Swords, Zap, Shield, X, MapPin } from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { Skull, Swords, Zap, Shield, X, MapPin, Settings as SettingsIcon, Trash2, Check, ArrowRight } from 'lucide-react';
 
 export const AdventureMap: React.FC = () => {
   const { 
@@ -20,6 +20,8 @@ export const AdventureMap: React.FC = () => {
     player,
     isAutoAttacking,
     toggleAutoAttack,
+    toggleAutoPlay,
+    isAutoPlay,
     useSkill,
     cooldowns,
     attackProgress,
@@ -30,24 +32,35 @@ export const AdventureMap: React.FC = () => {
   const [tempMapId, setTempMapId] = useState(currentMap?.id || '');
   const [tempSubMapId, setTempSubMapId] = useState(currentSubMap?.id || '');
 
+  const [quickPage, setQuickPage] = useState<number>(0);
+
   const handleEnterMap = () => {
     if (tempMapId && tempSubMapId) {
       selectMap(tempMapId, tempSubMapId);
     }
   };
 
-  if (!currentSubMap) {
+  const handleEnemySelection = (instanceId: string) => {
+    // SNAPPY TARGET SWITCHING: Shift lock directly instead of deselecting if clicked in active combat
+    if (inCombat) {
+      setSelectedEnemy(instanceId);
+    } else {
+      setSelectedEnemy(instanceId === selectedEnemyInstanceId ? null : instanceId);
+    }
+  };
+
+  if (!currentSubMap || !player) {
     return (
       <div className="p-8 h-full flex flex-col items-center justify-center gap-8 bg-slate-900/20">
         <div className="text-center space-y-2">
           <MapPin className="w-12 h-12 text-blue-500 mx-auto mb-4" />
-          <h2 className="text-2xl font-bold">選擇冒險地圖</h2>
-          <p className="text-slate-500 text-sm">準備好開始你的旅程了嗎？</p>
+          <h2 className="text-2xl font-black text-slate-100 italic tracking-wide">選擇冒險地圖</h2>
+          <p className="text-slate-500 text-xs">挑選怪物出沒的險惡秘境，開始奇幻戰役！</p>
         </div>
 
-        <div className="w-full max-w-xs space-y-4">
-          <div className="space-y-2">
-            <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">主地圖</label>
+        <div className="w-full max-w-xs space-y-4 bg-slate-900/60 p-5 rounded-2xl border border-slate-800/80 shadow-2xl">
+          <div className="space-y-1.5">
+            <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest pl-1">主地圖</label>
             <select 
               value={tempMapId} 
               onChange={(e) => {
@@ -55,7 +68,7 @@ export const AdventureMap: React.FC = () => {
                 const firstSub = MAP_DATA.find(m => m.id === e.target.value)?.subMaps[0].id || '';
                 setTempSubMapId(firstSub);
               }}
-              className="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-sm focus:outline-none focus:border-blue-500 transition-colors"
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs focus:outline-none focus:border-blue-500 transition-colors text-slate-200"
             >
               <option value="">選擇主地圖</option>
               {MAP_DATA.map(m => (
@@ -64,15 +77,15 @@ export const AdventureMap: React.FC = () => {
             </select>
           </div>
 
-          <div className="space-y-2">
-            <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">區域</label>
+          <div className="space-y-1.5">
+            <label className="text-[10px] font-bold text-slate-500 uppercase tracking-widest pl-1">細分區域</label>
             <select 
               value={tempSubMapId} 
               onChange={(e) => setTempSubMapId(e.target.value)}
               disabled={!tempMapId}
-              className="w-full bg-slate-900 border border-slate-800 rounded-xl p-3 text-sm focus:outline-none focus:border-blue-500 disabled:opacity-50 transition-colors"
+              className="w-full bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs focus:outline-none focus:border-blue-500 disabled:opacity-40 transition-colors text-slate-200"
             >
-              <option value="">選擇區域</option>
+              <option value="">選擇冒險細分區域</option>
               {MAP_DATA.find(m => m.id === tempMapId)?.subMaps.map(s => (
                 <option key={s.id} value={s.id}>{s.name}</option>
               ))}
@@ -82,9 +95,9 @@ export const AdventureMap: React.FC = () => {
           <button
             onClick={handleEnterMap}
             disabled={!tempMapId || !tempSubMapId}
-            className="w-full bg-blue-600 hover:bg-blue-500 disabled:bg-slate-800 py-4 rounded-xl font-bold text-lg transition-all shadow-lg shadow-blue-900/20 active:scale-95"
+            className="w-full bg-gradient-to-r from-blue-600 to-indigo-600 hover:from-blue-500 hover:to-indigo-500 disabled:from-slate-800 disabled:to-slate-850 py-3.5 rounded-xl font-bold text-sm text-white transition-all shadow-lg active:scale-95 duration-200 mt-2"
           >
-            進入地圖
+            踏上旅程 !
           </button>
         </div>
       </div>
@@ -92,9 +105,10 @@ export const AdventureMap: React.FC = () => {
   }
 
   const selectedEnemy = subMapEnemies.find(e => e.instanceId === selectedEnemyInstanceId);
-  const learnedSkills = player ? SKILL_DATA.filter(s => player.skills.includes(s.id)) : [];
-  const activeSkills = learnedSkills.filter(s => s.type === 'active');
-  const buffSkills = learnedSkills.filter(s => s.type === 'buff');
+  const learnedSkills = SKILL_DATA.filter(s => player.skills.includes(s.id));
+
+  // Filter nearby enemies which are alive
+  const aliveEnemies = subMapEnemies.filter(e => e.respawnTimer === 0);
 
   const sortedEnemies = [...subMapEnemies]
     .filter(e => e.respawnTimer === 0)
@@ -107,209 +121,301 @@ export const AdventureMap: React.FC = () => {
     });
 
   return (
-    <div className="h-full flex flex-col bg-slate-950">
-      {/* Top: Enemy List */}
-      <div className="flex-1 flex flex-col min-h-0 border-b border-slate-800">
-        <div className="p-3 bg-slate-900/50 flex justify-between items-center border-b border-slate-800">
-          <div className="flex items-center gap-2">
-            <Skull className="w-4 h-4 text-red-500" />
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">附近敵人 ({currentSubMap.name})</span>
-          </div>
-          <button 
-            onClick={() => selectMap('', '')}
-            className="text-[10px] text-slate-500 hover:text-red-400 transition-colors flex items-center gap-1"
-          >
-            <X className="w-3 h-3" /> 離開地圖
-          </button>
+    <div className="h-full flex flex-col bg-slate-950 relative">
+      {/* Top Section: Submap Header */}
+      <div className="p-3 bg-slate-900/80 flex justify-between items-center border-b border-slate-800/80">
+        <div className="flex items-center gap-2">
+          <div className="w-2.5 h-2.5 bg-emerald-500 rounded-full animate-ping" />
+          <span className="text-xs font-black text-slate-200 tracking-wider">
+            {currentMap?.name} <span className="text-slate-500 font-normal"> / </span> {currentSubMap.name}
+          </span>
         </div>
- 
-        <div className="flex-1 overflow-y-auto p-3 space-y-2">
-          {sortedEnemies.map((enemy) => (
-            <div 
-              key={enemy.instanceId}
-              onClick={() => setSelectedEnemy(enemy.instanceId === selectedEnemyInstanceId ? null : enemy.instanceId)}
-              className={`group relative bg-slate-900 border rounded-xl p-3 transition-all cursor-pointer ${
-                enemy.instanceId === selectedEnemyInstanceId 
-                  ? 'border-blue-500 bg-blue-900/10 shadow-lg shadow-blue-900/10' 
-                  : 'border-slate-800 hover:border-slate-700'
-              }`}
-            >
-              <div className="flex justify-between items-center">
-                <div className="flex-1">
-                  <div className="flex items-center gap-2">
-                    <span className={`font-bold ${enemy.instanceId === selectedEnemyInstanceId ? 'text-blue-400' : 'text-slate-200'}`}>
-                      {enemy.name}
-                    </span>
-                    {enemy.type === 'boss' && <span className="text-[8px] bg-red-600 px-1 rounded text-white font-bold">BOSS</span>}
-                    {enemy.type === 'miniboss' && <span className="text-[8px] bg-purple-600 px-1 rounded text-white font-bold">MINI</span>}
-                    {enemy.behavior === 'active' && <span className="text-[8px] bg-orange-600 px-1 rounded text-white">主動</span>}
-                  </div>
-                  <div className="flex items-center gap-3 mt-1.5">
-                    <div className="flex-1 h-1 bg-slate-800 rounded-full overflow-hidden">
-                      <div 
-                        className="h-full bg-red-500 transition-all duration-500" 
-                        style={{ width: `${(enemy.hp / enemy.maxHp) * 100}%` }}
-                      />
-                    </div>
-                    <span className="text-[10px] text-slate-500 font-mono">距離: {enemy.distance}m</span>
-                  </div>
-                </div>
-                
-                {enemy.respawnTimer > 0 && (
-                  <div className="text-[10px] text-slate-500 font-mono ml-4">
-                    {enemy.respawnTimer}s
-                  </div>
-                )}
-                
-                {enemy.instanceId === selectedEnemyInstanceId && enemy.respawnTimer === 0 && (
-                  <div className="ml-4 text-blue-500">
-                    <Shield className="w-4 h-4 fill-current" />
-                  </div>
-                )}
-              </div>
-            </div>
-          ))}
-        </div>
+        <button 
+          onClick={() => selectMap('', '')}
+          className="text-[10px] text-slate-400 hover:text-red-400/90 transition-colors flex items-center gap-1 border border-slate-800 px-2.5 py-1 rounded-lg bg-slate-950/60"
+        >
+          <X className="w-3 h-3" /> 離開此地圖
+        </button>
       </div>
 
-      {/* Bottom: Combat Controls */}
-      <div className="h-64 bg-slate-900 p-4 flex flex-col gap-4 shadow-2xl">
-        <div className="flex items-center justify-between border-b border-slate-800 pb-2">
-          <div className="flex items-center gap-2">
-            <Swords className="w-4 h-4 text-blue-400" />
-            <span className="text-xs font-bold text-slate-400 uppercase tracking-wider">戰鬥指令</span>
+      {/* Middle Grid: Enemy List */}
+      <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
+        {/* Nearby Active Targets Screen */}
+        <div className="p-2 border-b border-slate-900 bg-slate-950 flex justify-between items-center px-4 self-stretch">
+          <div className="flex items-center gap-1.5">
+            <Skull className="w-3.5 h-3.5 text-slate-400" />
+            <span className="text-[10px] font-black text-slate-400 uppercase tracking-wider">附近目標 ({aliveEnemies.length})</span>
           </div>
-          {selectedEnemy && (
-            <div className="text-[10px] text-blue-400 font-bold flex items-center gap-2">
-              鎖定中: {selectedEnemy.name} ({selectedEnemy.hp}/{selectedEnemy.maxHp})
-              <button onClick={() => setSelectedEnemy(null)} className="text-slate-500 hover:text-red-400">
-                <X className="w-3 h-3" />
-              </button>
+          <span className="text-[9px] text-slate-500 italic">點擊怪物立刻切換鎖定對象</span>
+        </div>
+
+        {/* Scrollable Enemy Cards */}
+        <div className="flex-1 overflow-y-auto p-3 space-y-2 select-none">
+          {sortedEnemies.map((enemy) => {
+            const isSelected = enemy.instanceId === selectedEnemyInstanceId;
+            const isCombatTarget = inCombat && currentEnemy && enemy.instanceId === currentEnemy.instanceId;
+
+            return (
+              <div 
+                key={enemy.instanceId}
+                onClick={() => handleEnemySelection(enemy.instanceId)}
+                className={`group relative bg-slate-900/60 border rounded-xl p-3 transition-all cursor-pointer ${
+                  isCombatTarget 
+                    ? 'border-red-500/40 bg-red-950/10 shadow-lg shadow-red-950/10'
+                    : isSelected 
+                      ? 'border-blue-500/40 bg-blue-900/10 shadow-lg shadow-blue-900/10' 
+                      : 'border-slate-800/80 hover:border-slate-700'
+                }`}
+              >
+                <div className="flex justify-between items-center gap-2">
+                  <div className="flex-1">
+                    <div className="flex items-center gap-1.5">
+                      <span className={`font-extrabold text-sm ${
+                        isCombatTarget ? 'text-red-400' : isSelected ? 'text-blue-400' : 'text-slate-200'
+                      }`}>
+                        {enemy.name}
+                      </span>
+                      {enemy.type === 'boss' && <span className="text-[8px] bg-red-600 px-1.5 py-0.5 rounded text-white font-black leading-none uppercase">BOSS</span>}
+                      {enemy.type === 'miniboss' && <span className="text-[8px] bg-purple-600 px-1.5 py-0.5 rounded text-white font-black leading-none uppercase">MINI</span>}
+                      {enemy.behavior === 'active' && (
+                        <span className="text-[8px] bg-amber-900/35 border border-amber-800 text-amber-400 px-1.5 py-0.5 rounded leading-none">
+                          主動
+                        </span>
+                      )}
+                    </div>
+                    
+                    <div className="flex items-center gap-3 mt-2">
+                      <div className="flex-1 h-1.5 bg-slate-950 rounded-full overflow-hidden">
+                        <div 
+                          className={`h-full transition-all duration-300 ${isCombatTarget ? 'bg-red-500' : 'bg-blue-500'}`} 
+                          style={{ width: `${(enemy.maxHp && !isNaN(enemy.hp) && !isNaN(enemy.maxHp)) ? Math.min(100, Math.max(0, (enemy.hp / enemy.maxHp) * 100)) : 0}%` }}
+                        />
+                      </div>
+                      <span className="text-[9px] text-slate-400 font-mono font-bold shrink-0">
+                        HP: {isNaN(enemy.hp) ? 0 : Math.floor(enemy.hp)} / {enemy.maxHp || 0}
+                      </span>
+                      <span className="text-[9px] text-slate-500 font-mono shrink-0">距離: {typeof enemy.distance === 'number' ? enemy.distance.toFixed(1) : enemy.distance}m</span>
+                    </div>
+                  </div>
+
+                  <div className="shrink-0 pl-1.5 flex flex-col items-center">
+                    {isCombatTarget ? (
+                      <div className="bg-red-600/20 text-red-400 p-1 rounded-full border border-red-500/20 animate-pulse">
+                        <Swords className="w-4 h-4" />
+                      </div>
+                    ) : isSelected ? (
+                      <div className="bg-blue-600/20 text-blue-400 p-1 rounded-full border border-blue-500/20">
+                        <Shield className="w-4 h-4 fill-current" />
+                      </div>
+                    ) : (
+                      <div className="text-slate-600 group-hover:text-slate-400 transition-colors">
+                        <ArrowRight className="w-3.5 h-3.5" />
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            );
+          })}
+          
+          {sortedEnemies.length === 0 && (
+            <div className="py-12 text-center space-y-2">
+              <Skull className="w-8 h-8 text-slate-800 mx-auto" />
+              <p className="text-slate-600 text-xs italic">此處的所有怪物皆已被擊退，重生整備中...</p>
             </div>
           )}
         </div>
+      </div>
 
-        <div className="flex-1 grid grid-cols-12 gap-4">
-          {/* Main Actions */}
-          <div className="col-span-4 flex flex-col gap-2">
+      {/* Bottom Layout: Combat Action Panels & Hotkeys */}
+      <div className="bg-slate-900 p-3 pb-3 px-4 flex flex-col gap-2.5 shadow-2xl rounded-t-2xl border-t border-slate-800/80 z-10">
+        <div className="grid grid-cols-12 gap-3 items-stretch">
+          {/* Left Block: Basic Action Gears (4 Columns) */}
+          <div className="col-span-4 flex flex-col gap-2 justify-between">
+            {/* Primary Manual Combat Trigger */}
             <button
               onClick={() => startCombat()}
               disabled={!selectedEnemy || inCombat}
-              className={`flex-1 flex flex-col items-center justify-center gap-1 rounded-xl font-bold transition-all relative overflow-hidden ${
+              className={`flex-1 min-h-[4.2rem] flex flex-col items-center justify-center gap-1 rounded-xl font-bold transition-all relative overflow-hidden ${
                 inCombat 
-                  ? 'bg-red-600 text-white' 
+                  ? 'bg-red-900/20 border border-red-500/30 text-red-400 font-black animate-pulse' 
                   : selectedEnemy 
-                    ? 'bg-blue-600 text-white hover:bg-blue-500 shadow-lg shadow-blue-900/20' 
-                    : 'bg-slate-800 text-slate-600 cursor-not-allowed'
+                    ? 'bg-blue-600 text-white hover:bg-blue-500 shadow-lg shadow-blue-900/20 cursor-pointer active:scale-95' 
+                    : 'bg-slate-950 border border-slate-850 text-slate-655 cursor-not-allowed'
               }`}
             >
-              {inCombat && (
-                <motion.div 
-                  className="absolute bottom-0 left-0 h-1 bg-white/50"
-                  initial={{ width: 0 }}
-                  animate={{ width: `${attackProgress * 100}%` }}
-                  transition={{ duration: 0.1 }}
-                />
-              )}
-              <Swords className="w-6 h-6" />
-              <span className="text-xs">{inCombat ? '戰鬥中' : '普通攻擊'}</span>
+              <Swords className="w-5 h-5" />
+              <span className="text-[10px] uppercase tracking-wide">
+                {inCombat ? '自動攻擊中' : '普通攻擊'}
+              </span>
             </button>
-            {inCombat && (
+
+            {/* Manual & Auto Mode Toggle Switch */}
+            <div className="grid grid-cols-2 gap-1 bg-slate-950 p-1 rounded-xl border border-slate-850">
               <button
-                onClick={toggleAutoAttack}
-                className={`py-2 rounded-lg text-[10px] font-bold transition-colors ${
-                  isAutoAttacking ? 'bg-orange-600 text-white' : 'bg-slate-800 text-slate-400'
+                onClick={() => { if (!isAutoPlay) toggleAutoPlay(); }}
+                className={`py-1.5 rounded-lg text-[9px] font-black tracking-wider text-center transition-all ${
+                  isAutoPlay 
+                    ? 'bg-blue-600 text-white shadow-md' 
+                    : 'text-slate-500 hover:text-slate-300'
                 }`}
               >
-                {isAutoAttacking ? '自動攻擊 ON' : '自動攻擊 OFF'}
+                自動
               </button>
-            )}
+              <button
+                onClick={() => { if (isAutoPlay) toggleAutoPlay(); }}
+                className={`py-1.5 rounded-lg text-[9px] font-black tracking-wider text-center transition-all ${
+                  !isAutoPlay 
+                    ? 'bg-orange-600 text-white shadow-md' 
+                    : 'text-slate-500 hover:text-slate-300'
+                }`}
+              >
+                手動
+              </button>
+            </div>
           </div>
 
-          {/* Skills & Items Grid */}
-          <div className="col-span-8 flex flex-col gap-2">
-            {/* Buffs Display */}
-            {activeBuffs.length > 0 && (
-              <div className="flex flex-wrap gap-1 mb-1">
-                {activeBuffs.map(buff => (
-                  <div key={buff.id} className="px-1.5 py-0.5 bg-blue-500/20 border border-blue-500/30 rounded text-[8px] text-blue-400 flex items-center gap-1">
-                    <Shield className="w-2 h-2" />
-                    <span>{buff.id === 'haste_potion' ? '加速' : (buff.id === 'wind_walk' ? '風之疾走' : buff.id)}</span>
-                    <span className="font-mono">{Math.ceil(buff.remaining)}s</span>
-                  </div>
-                ))}
-              </div>
-            )}
+          {/* Right Block: Paginated Quick Skill & Quick Item Slots (8 Columns) */}
+          <div className="col-span-8 flex flex-col gap-1.5 relative">
             
-            {/* Skills */}
-            <div className="grid grid-cols-4 gap-2">
-              {player.quickSkills.map((skillId, i) => {
-                const skill = skillId ? SKILL_DATA.find(s => s.id === skillId) : null;
-                if (!skill) return (
-                  <div key={i} className="aspect-square bg-slate-900/50 border border-slate-800 border-dashed rounded-lg flex items-center justify-center">
-                    <span className="text-[8px] text-slate-700 italic">未設定</span>
-                  </div>
-                );
-                
-                const activeBuff = activeBuffs.find(b => b.id === skill.id);
-                const isBuff = skill.type === 'buff';
-                
-                return (
-                  <button
-                    key={i}
-                    onClick={() => useSkill(skill.id)}
-                    disabled={(isBuff ? false : !inCombat) || (player?.mp || 0) < skill.mpCost || cooldowns[skill.id] > 0}
-                    className="relative aspect-square bg-slate-800 rounded-lg border border-slate-700 flex flex-col items-center justify-center gap-1 hover:bg-slate-700 disabled:opacity-30 transition-all group overflow-hidden"
-                  >
-                    {isBuff ? (
-                      <Shield className="w-4 h-4 text-green-400 group-hover:scale-110 transition-transform" />
-                    ) : (
-                      <Zap className="w-4 h-4 text-blue-400 group-hover:scale-110 transition-transform" />
-                    )}
-                    <span className="text-[8px] text-center px-1 truncate w-full">{skill.name}</span>
-                    {activeBuff && (
-                      <div className="absolute top-0 right-0 bg-blue-500 text-[8px] px-1 rounded-bl rounded-tr font-mono z-10">
-                        {Math.ceil(activeBuff.remaining)}s
-                      </div>
-                    )}
-                    {cooldowns[skill.id] > 0 && (
-                      <div className="absolute inset-0 bg-black/60 flex items-center justify-center">
-                        <span className="text-white font-bold text-[10px]">{Math.ceil(cooldowns[skill.id])}</span>
-                      </div>
-                    )}
-                  </button>
-                );
-              })}
+            {/* Page Segment Swapper */}
+            <div className="flex bg-slate-950 p-1 rounded-xl border border-slate-850 gap-1 w-full shrink-0">
+              <button
+                onClick={() => setQuickPage(0)}
+                className={`flex-1 py-1 rounded-lg text-[10px] font-black tracking-wider text-center transition-all ${
+                  quickPage === 0 
+                    ? 'bg-indigo-600 text-white shadow-md' 
+                    : 'text-slate-500 hover:text-slate-300 hover:bg-slate-900/40'
+                }`}
+              >
+                快捷槽 (1 - 4)
+              </button>
+              <button
+                onClick={() => setQuickPage(1)}
+                className={`flex-1 py-1 rounded-lg text-[10px] font-black tracking-wider text-center transition-all ${
+                  quickPage === 1 
+                    ? 'bg-indigo-600 text-white shadow-md' 
+                    : 'text-slate-500 hover:text-slate-300 hover:bg-slate-900/40'
+                }`}
+              >
+                快捷槽 (5 - 8)
+              </button>
             </div>
 
-            {/* Quick Items */}
-            <div className="grid grid-cols-4 gap-2 border-t border-slate-800 pt-2">
-              {player?.quickItems.map((itemId, i) => {
-                const item = itemId ? ITEM_DATA.find(it => it.id === itemId) : null;
-                const count = player?.inventory
-                  .filter(it => it.id === itemId)
-                  .reduce((sum, it) => sum + it.quantity, 0) || 0;
-                
-                return (
-                  <button
-                    key={i}
-                    onClick={() => useQuickItem(i)}
-                    disabled={!itemId || count === 0}
-                    className="relative aspect-square bg-slate-900 border border-slate-800 rounded-lg flex flex-col items-center justify-center gap-1 hover:border-slate-600 transition-all group"
-                  >
-                    <span className="absolute top-0 left-0 text-[8px] text-slate-600 p-1 font-mono">{i + 1}</span>
-                    {item ? (
-                      <>
-                        <span className="text-[8px] text-center px-1 truncate w-full text-blue-400">{item.name}</span>
-                        <span className="text-[10px] font-bold text-slate-500">{count}</span>
-                      </>
-                    ) : (
-                      <span className="text-[8px] text-slate-700 italic">未設定</span>
-                    )}
-                  </button>
-                );
-              })}
+            <div className="flex flex-col gap-2">
+              {/* Top Row: Skills (4 Slots, upper row) */}
+              <div className="space-y-1 bg-slate-950/40 p-2 rounded-xl border border-slate-800/60">
+                <div className="flex justify-between items-center px-1">
+                  <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1">
+                    <Zap className="w-2.5 h-2.5 text-indigo-400" /> 技能 (F1-F4)
+                  </span>
+                  <span className="text-[8px] font-mono text-slate-500 font-bold uppercase tracking-wider">SKILLS</span>
+                </div>
+
+                <div className="grid grid-cols-4 gap-2">
+                  {Array.from({ length: 4 }).map((_, localIndex) => {
+                    const actualIndex = quickPage * 4 + localIndex;
+                    const skillId = player.quickSkills[actualIndex];
+                    const skill = skillId ? SKILL_DATA.find(s => s.id === skillId) : null;
+                    const isSkillOnCooldown = skill ? (cooldowns[skill.id] > 0) : false;
+
+                    return (
+                      <button
+                        key={actualIndex}
+                        onClick={() => {
+                          if (skill) {
+                            useSkill(skill.id);
+                          }
+                        }}
+                        className={`relative h-14 md:h-16 rounded-xl flex flex-col items-center justify-center p-1.5 border transition-all ${
+                          skill 
+                            ? 'bg-slate-800 border-indigo-500/60 hover:bg-slate-750 hover:border-indigo-400 active:scale-95 shadow-lg shadow-indigo-950/40' 
+                            : 'bg-slate-950 border-slate-850 border-dashed hover:border-slate-800'
+                        }`}
+                      >
+                        <span className="absolute top-1 left-1 text-[7px] px-1 py-0.5 rounded bg-slate-950/85 text-slate-400 font-mono scale-90 leading-none">F{actualIndex + 1}</span>
+                        
+                        {skill ? (
+                          <div className="flex flex-col items-center gap-0.5 pt-1">
+                            {skill.type === 'buff' ? (
+                              <Shield className="w-4 h-4 text-teal-400 shrink-0" />
+                            ) : (
+                              <Zap className="w-4 h-4 text-blue-400 shrink-0" />
+                            )}
+                            <span className="text-[10px] text-center font-bold text-slate-100 truncate w-full px-1">
+                              {skill.name}
+                            </span>
+
+                            {isSkillOnCooldown && (
+                              <div className="absolute inset-0 bg-slate-950/95 rounded-xl flex items-center justify-center animate-pulse">
+                                <span className="text-white font-black text-xs font-mono">{Math.ceil(cooldowns[skill.id])}s</span>
+                              </div>
+                            )}
+                          </div>
+                        ) : (
+                          <span className="text-[8px] text-slate-755 font-bold uppercase tracking-wider">空</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+
+              {/* Bottom Row: Items (4 Slots, lower row) */}
+              <div className="space-y-1 bg-slate-950/40 p-2 rounded-xl border border-slate-800/60">
+                <div className="flex justify-between items-center px-1">
+                  <span className="text-[9px] font-black text-slate-400 uppercase tracking-widest flex items-center gap-1">
+                    <Shield className="w-2.5 h-2.5 text-emerald-400" /> 藥水 (F1-F4)
+                  </span>
+                  <span className="text-[8px] font-mono text-slate-500 font-bold uppercase tracking-wider">POTIONS</span>
+                </div>
+
+                <div className="grid grid-cols-4 gap-2">
+                  {Array.from({ length: 4 }).map((_, localIndex) => {
+                    const actualIndex = quickPage * 4 + localIndex;
+                    const itemId = player.quickItems[actualIndex];
+                    const item = itemId ? ITEM_DATA.find(it => it.id === itemId) : null;
+                    const count = player.inventory
+                      .filter(it => it.id === itemId)
+                      .reduce((sum, it) => sum + it.quantity, 0) || 0;
+
+                    return (
+                      <button
+                        key={actualIndex}
+                        onClick={() => {
+                          if (item) {
+                            useQuickItem(actualIndex);
+                          }
+                        }}
+                        className={`relative h-14 md:h-16 rounded-xl flex flex-col items-center justify-center p-1.5 border transition-all ${
+                          item 
+                            ? 'bg-slate-800 border-emerald-500/60 hover:bg-slate-750 hover:border-emerald-400 active:scale-95 shadow-lg shadow-emerald-950/40' 
+                            : 'bg-slate-950 border-slate-850 border-dashed hover:border-slate-800'
+                        }`}
+                      >
+                        <span className="absolute top-1 left-1 text-[7px] px-1 py-0.5 rounded bg-slate-950/85 text-slate-400 font-mono scale-90 leading-none">F{actualIndex + 1}</span>
+                        
+                        {item ? (
+                          <div className="flex flex-col items-center gap-1 pt-1">
+                            <span className={`text-[10px] text-center font-black truncate w-full px-0.5 ${
+                              item.id === 'hp_potion_s' ? 'text-red-400' : item.id === 'mp_potion_s' ? 'text-blue-400' : 'text-amber-400'
+                            }`}>
+                              {item.name}
+                            </span>
+                            <span className="text-[9px] font-extrabold text-slate-400 font-mono bg-slate-955/60 px-1 py-0.5 rounded-md border border-slate-900 leading-none">
+                              x{count}
+                            </span>
+                          </div>
+                        ) : (
+                          <span className="text-[8px] text-slate-755 font-bold uppercase tracking-wider">空</span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
+
           </div>
         </div>
       </div>
