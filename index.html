@@ -4,6 +4,17 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>文字領域傳說 (Legend of the Text Realm)</title>
+    <script>
+      (function() {
+        var path = window.location.pathname;
+        if (!path.endsWith('/')) {
+          var lastSegment = path.substring(path.lastIndexOf('/') + 1);
+          if (lastSegment && !lastSegment.includes('.')) {
+            window.location.replace(window.location.pathname + '/' + window.location.search + window.location.hash);
+          }
+        }
+      })();
+    </script>
     <link rel="manifest" href="./manifest.json" />
   </head>
   <body>
