@@ -6,8 +6,11 @@ import { VitePWA } from 'vite-plugin-pwa';
 
 export default defineConfig(({mode}) => {
   const env = loadEnv(mode, '.', '');
+  const isGithubActions = process.env.GITHUB_ACTIONS === 'true';
+  const base = isGithubActions ? '/Text-Adv./' : '/';
+
   return {
-    base: './',
+    base,
     plugins: [
       react(), 
       tailwindcss(),
@@ -22,8 +25,8 @@ export default defineConfig(({mode}) => {
           background_color: '#0f172a',
           display: 'standalone',
           orientation: 'portrait',
-          start_url: '.',
-          scope: './',
+          start_url: base,
+          scope: base,
           icons: [
             {
               src: 'https://picsum.photos/seed/rpg/192/192',
