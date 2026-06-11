@@ -22,7 +22,8 @@ export default defineConfig(({mode}) => {
           background_color: '#0f172a',
           display: 'standalone',
           orientation: 'portrait',
-          start_url: '/',
+          start_url: '.',
+          scope: './',
           icons: [
             {
               src: 'https://picsum.photos/seed/rpg/192/192',
